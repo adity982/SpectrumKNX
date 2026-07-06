@@ -58,7 +58,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Check if image tag already exists
+        id: check_tag
+        run: |
+          IMAGE="${{ env.IMAGE_BASE }}-${{ matrix.ha_arch }}:${{ steps.addon_version.outputs.version }}"
+          # Only skip on main branch pushes to allow manual runs/tag releases to overwrite if needed
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]] && docker manifest inspect "$IMAGE" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Image $IMAGE already exists in registry. Skipping build/push on main to prevent overwrite."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and push Docker image
+        if: steps.check_tag.outputs.exists != 'true'
         uses: docker/build-push-action@v5
         with:
           context: .
