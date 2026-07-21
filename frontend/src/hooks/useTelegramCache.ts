@@ -16,6 +16,20 @@ const FLUSH_INTERVAL_MS = 2000;
 const FLUSH_BATCH_SIZE = 200;
 /** Cache size enforcement cadence (in flush ticks: 30 × 2 s = every minute). */
 const EVICT_EVERY_TICKS = 30;
+/**
+ * Telegrams pulled in for the first paint on startup (#284). We hydrate only
+ * the newest slice from cache and fetch at most this many from the backend,
+ * newest-first; older history stays in IDB and is loaded on demand via the
+ * history loader. Keeps startup cheap on low-power hosts (e.g. RasPi4) and the
+ * buffer off its capacity ceiling, where eviction churn lives (#297).
+ */
+const INITIAL_LOAD_LIMIT = 5000;
+/**
+ * Rows fetched per backend request while filling a gap (#284). History loads
+ * page backward in chunks of this size and paint after every chunk, so the list
+ * and charts build progressively instead of blocking on one large fetch.
+ */
+const HISTORY_CHUNK_SIZE = 2000;
 
 export interface TelegramCache {
   /** Current buffer contents, newest first. Frozen while paused. */
@@ -117,26 +131,67 @@ export function useTelegramCache(maxSize: number): TelegramCache {
     saveCoverageIntervals(coverageRef.current!.covered);
   }, []);
 
-  /** Fetches every uncovered sub-range of [startMs, endMs] from the backend. */
-  const fillGaps = useCallback(
-    async (startMs: number, endMs: number) => {
-      const coverage = coverageRef.current!;
-      for (const [gapStart, gapEnd] of coverage.gaps(startMs, endMs)) {
-        const { entries, limitReached } = await fetchRange(gapStart, gapEnd, maxSize);
+  /**
+   * Progressively fills one uncovered sub-range, newest-first, publishing after
+   * every chunk so the UI builds as data streams in (#284). Pages backward in
+   * `HISTORY_CHUNK_SIZE` requests until the gap is exhausted or `budget` rows
+   * have been fetched; a budget cut-off leaves the older remainder uncovered for
+   * a later load. Returns how many telegrams were fetched (for cross-gap budgeting).
+   */
+  const fetchGapProgressive = useCallback(
+    async (gapStart: number, gapEnd: number, budget: number): Promise<number> => {
+      let cursor = gapEnd;
+      let fetched = 0;
+      while (cursor >= gapStart && fetched < budget) {
+        const limit = Math.min(HISTORY_CHUNK_SIZE, budget - fetched);
+        const { entries, limitReached } = await fetchRange(gapStart, cursor, limit);
+        if (entries.length === 0) {
+          // Nothing left in this window — the rest is covered-but-empty.
+          coverageRef.current!.addCovered(gapStart, cursor);
+          break;
+        }
         if (mergeIntoBuffer(entries)) publish();
         cacheRef.current!.store(entries).catch(() => {});
-        if (limitReached && entries.length > 0) {
-          // Only the newest `limit` rows arrived — the older remainder of the
-          // gap stays uncovered so a later load can still fetch it.
-          const oldestTs = entries[entries.length - 1].ts;
-          coverage.addCovered(oldestTs, gapEnd);
-        } else {
-          coverage.addCovered(gapStart, gapEnd);
+        fetched += entries.length;
+        const oldestTs = entries[entries.length - 1].ts;
+        coverageRef.current!.addCovered(oldestTs, cursor);
+        if (!limitReached) {
+          // The whole remaining window came back — the gap is fully covered.
+          coverageRef.current!.addCovered(gapStart, cursor);
+          break;
         }
+        // Page further back. Re-including `oldestTs` (dedup handles the repeat)
+        // avoids dropping siblings that share that millisecond; step past it only
+        // when a whole chunk sat on one timestamp, to guarantee progress.
+        cursor = oldestTs < cursor ? oldestTs : cursor - 1;
+      }
+      return fetched;
+    },
+    [mergeIntoBuffer, publish],
+  );
+
+  /**
+   * Fills the uncovered sub-ranges of [startMs, endMs] newest-first, chunk by
+   * chunk, up to `budget` telegrams total. Older gaps (and the remainder of the
+   * gap where the budget runs out) stay uncovered for on-demand loading, so a
+   * load never blocks on more history than asked for (#284).
+   */
+  const fillGapsBudgeted = useCallback(
+    async (startMs: number, endMs: number, budget: number) => {
+      const gaps = coverageRef.current!.gaps(startMs, endMs);
+      let remaining = budget;
+      for (let i = gaps.length - 1; i >= 0 && remaining > 0; i--) {
+        remaining -= await fetchGapProgressive(gaps[i][0], gaps[i][1], remaining);
       }
       saveCoverage();
     },
-    [maxSize, mergeIntoBuffer, publish, saveCoverage],
+    [fetchGapProgressive, saveCoverage],
+  );
+
+  /** Fills every uncovered sub-range of [startMs, endMs], bounded by the buffer size. */
+  const fillGaps = useCallback(
+    (startMs: number, endMs: number) => fillGapsBudgeted(startMs, endMs, maxSize),
+    [fillGapsBudgeted, maxSize],
   );
 
   /** Wraps a background load with the shared loading/error state. */
@@ -189,15 +244,21 @@ export function useTelegramCache(maxSize: number): TelegramCache {
 
       const cached = await cacheRef.current!.loadAll().catch(() => [] as TelegramEntry[]);
       if (cancelled) return;
-      if (cached.length > 0 && mergeIntoBuffer(cached)) publish();
+      // Hydrate only the newest slice for a fast first paint; the older cached
+      // remainder stays in IDB and is pulled in on demand via the history
+      // loader / lazy loads (#284). Never exceed the configured buffer size.
+      const budget = Math.min(INITIAL_LOAD_LIMIT, maxSize);
+      const initialCached = cached.slice(0, budget);
+      if (initialCached.length > 0 && mergeIntoBuffer(initialCached)) publish();
 
-      // Fill everything between the oldest known data and now (#211): the
-      // dashboard-switch / closed-tab window arrives without user action.
+      // Fill the most recent gaps up to the budget (#211): the dashboard-switch
+      // / closed-tab window arrives without user action, but older history is
+      // deferred so startup stays cheap on low-power hosts.
       const coveredStart = coverage.covered[0]?.[0];
       const oldestCached = cached.length > 0 ? cached[cached.length - 1].ts : undefined;
       const start = Math.min(coveredStart ?? Infinity, oldestCached ?? Infinity);
       if (Number.isFinite(start)) {
-        await fillGaps(start, Date.now());
+        await fillGapsBudgeted(start, Date.now(), budget);
       }
     });
     return () => {

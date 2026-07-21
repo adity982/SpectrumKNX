@@ -111,6 +111,31 @@ describe('useTelegramCache', () => {
     expect(Date.parse(params.get('start_time')!)).toBe(2001);
   });
 
+  it('hydrates only the newest slice of a large cache on startup, keeping the rest loadable (#284)', async () => {
+    // Seed more than the 5000 initial-load budget, all already covered so no
+    // gap fetch masks the cap.
+    const count = 5100;
+    seedIdb(Array.from({ length: count }, (_, i) => tg(i + 1, `c${i + 1}`)));
+    localStorage.setItem(COVERAGE_STORAGE_KEY, JSON.stringify([[1, count]]));
+    telegramResponses.push({ telegrams: [] }); // trailing [covered…now] gap is empty
+
+    const { result } = renderHook(() => useTelegramCache(100_000));
+    await settle(result);
+
+    // Only the newest 5000 paint; the older remainder stays in IDB untouched.
+    expect(result.current.telegrams).toHaveLength(5000);
+    expect(result.current.telegrams[0].source_address).toBe(`1.2.c${count}`);
+    expect(_idb.size).toBe(count);
+
+    // The older cached rows are still reachable on demand, from cache alone.
+    const before = fetchCalls.filter(u => u.includes('/api/telegrams')).length;
+    await act(async () => {
+      await result.current.loadRange(1, 100);
+    });
+    expect(result.current.telegrams).toHaveLength(count);
+    expect(fetchCalls.filter(u => u.includes('/api/telegrams')).length).toBe(before);
+  });
+
   it('publishes live telegrams newest first', async () => {
     const { result } = renderHook(() => useTelegramCache(1000));
     await settle(result);
@@ -189,14 +214,42 @@ describe('useTelegramCache', () => {
     expect(Date.parse(params.get('end_time')!)).toBe(999);
   });
 
-  it('keeps the unfetched remainder uncovered when the limit is reached', async () => {
-    localStorage.setItem(COVERAGE_STORAGE_KEY, JSON.stringify([[10_000, 10_000]]));
-    telegramResponses.push({ telegrams: [] }); // startup gap fill
+  it('loads a gap in newest-first chunks, painting after each (#284)', async () => {
+    // Coverage forces a single gap [0, 6000]; the backend serves it in two chunks.
+    localStorage.setItem(COVERAGE_STORAGE_KEY, JSON.stringify([[6001, 6001]]));
+    telegramResponses.push({ telegrams: [] }); // startup gap [6002, now]
+    telegramResponses.push({ telegrams: [tg(5000, 'a'), tg(4000, 'b')], limitReached: true }); // chunk 1 (newest)
+    telegramResponses.push({ telegrams: [tg(3000, 'c'), tg(2000, 'd')] }); // chunk 2 (older, final)
 
     const { result } = renderHook(() => useTelegramCache(1000));
     await settle(result);
 
-    // Only the newest row of [0, 9999] arrives.
+    const before = fetchCalls.filter(u => u.includes('/api/telegrams')).length;
+    await act(async () => {
+      await result.current.loadRange(0, 6000);
+    });
+    const loadFetches = fetchCalls.filter(u => u.includes('/api/telegrams')).length - before;
+
+    // Two chunk requests, all four telegrams merged newest-first.
+    expect(loadFetches).toBe(2);
+    expect(result.current.telegrams.map(t => t.source_address)).toEqual([
+      '1.2.a', '1.2.b', '1.2.c', '1.2.d',
+    ]);
+    // The second chunk paged back to just the older remainder (up to chunk 1's oldest ts).
+    const chunk2 = fetchCalls.filter(u => u.includes('/api/telegrams')).at(-1)!;
+    const chunk2Params = new URLSearchParams(chunk2.split('?')[1]);
+    expect(Date.parse(chunk2Params.get('end_time')!)).toBe(4000);
+  });
+
+  it('stops at the load budget and leaves the older remainder uncovered (#284)', async () => {
+    localStorage.setItem(COVERAGE_STORAGE_KEY, JSON.stringify([[10_000, 10_000]]));
+    telegramResponses.push({ telegrams: [] }); // startup gap fill
+
+    // Buffer size 1 → the load budget is a single telegram: the first chunk
+    // exhausts it and paging stops, deferring the rest.
+    const { result } = renderHook(() => useTelegramCache(1));
+    await settle(result);
+
     telegramResponses.push({ telegrams: [tg(9000, 'partial')], limitReached: true });
     await act(async () => {
       await result.current.loadRange(0, 10_000);

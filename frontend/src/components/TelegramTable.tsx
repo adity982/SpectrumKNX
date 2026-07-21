@@ -352,14 +352,24 @@ export const TelegramTable: React.FC<TelegramTableProps> = ({
     : null;
 
   // Correct scrollTop so the anchored row keeps its recorded viewport offset.
-  // Only the top (newest-first) edge needs this — bottom-appends don't move the
-  // content above the viewport.
+  // Both edges need this. Newest-first (top edge) prepends live rows above the
+  // viewport; oldest-first (bottom edge) looks safe — bottom-appends don't move
+  // content above the viewport — until the buffer hits capacity, when each new
+  // telegram also evicts the oldest from the head, i.e. the top of the asc view,
+  // shifting everything above the viewport up and drifting the read row (#297).
+  // Progressive history chunks (#284) prepend older rows at the top of the asc
+  // view the same way; the measured pixel delta absorbs all of these uniformly.
   const pinAnchor = () => {
     const el = parentRef.current;
     const anchor = anchorRef.current;
-    if (!el || !anchor || atEdgeRef.current || liveEdge !== 'top') return;
+    if (!el || !anchor || atEdgeRef.current) return;
     const now = rowOffset(anchor.key);
-    if (now == null) return;
+    if (now == null) {
+      // The anchored row was evicted out from under us (#297): re-pin to the
+      // current top-most visible row so freezing continues from where we are.
+      captureAnchor();
+      return;
+    }
     const delta = now - anchor.offset;
     if (Math.abs(delta) > 0.5) {
       markProgrammatic();

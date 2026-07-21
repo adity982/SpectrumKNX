@@ -114,6 +114,43 @@ test('clicking a row pauses live-following (#266)', () => {
   expect(screen.getByText(/1 new telegram/)).toBeInTheDocument();
 });
 
+test('newest-on-bottom: clicking a row stays anchored while the full buffer evicts (#297)', () => {
+  const asc: SortConfig = { key: 'timestamp', direction: 'asc' };
+  // In asc view the parent hands rows oldest-first, newest at the bottom edge.
+  const oldestFirst = (count: number, newestOffsetS: number) => makeList(count, newestOffsetS).slice().reverse();
+  const renderAsc = (telegrams: Telegram[]) =>
+    render(
+      <TelegramTable
+        telegrams={telegrams}
+        visibleColumns={visibleColumns}
+        sortConfig={asc}
+        onSort={vi.fn()}
+        activeFilters={DEFAULT_FILTERS}
+        onQuickFilter={vi.fn()}
+        onQuickVisualize={vi.fn()}
+      />,
+    );
+
+  const { container, rerender } = renderAsc(oldestFirst(6, 5));
+  // Click a row that is neither the oldest nor the newest, then simulate a
+  // capacity eviction: one new telegram at the bottom, one dropped from the top.
+  fireEvent.click(container.querySelectorAll('.log-row')[2]);
+  rerender(
+    <TelegramTable
+      telegrams={oldestFirst(6, 6)}
+      visibleColumns={visibleColumns}
+      sortConfig={asc}
+      onSort={vi.fn()}
+      activeFilters={DEFAULT_FILTERS}
+      onQuickFilter={vi.fn()}
+      onQuickVisualize={vi.fn()}
+    />,
+  );
+
+  // The list stayed anchored rather than snapping to the (bottom) live edge.
+  expect(screen.getByText(/1 new telegram/)).toBeInTheDocument();
+});
+
 test('without a click the table keeps following the live edge', () => {
   renderTable(makeList(6, 5));
   const { rerender } = renderTable(makeList(6, 5));
