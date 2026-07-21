@@ -9,6 +9,7 @@
 ### Changed
 
 - **Buffer controls moved into the status bar**: the clear and load-history actions now sit next to the buffer count, with an inline marker when the buffer is full (#284).
+- **Building structure — readable function group-address table**: a function's associated group addresses now show their real ETS name and DPT instead of an internal role UUID, reordered to GA · Name · DPT · Time · Value with absolute timestamps and a per-row send-to-bus action (#295).
 
 ### Fixed
 
