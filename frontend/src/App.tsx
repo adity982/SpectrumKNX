@@ -579,6 +579,17 @@ function App() {
     ? activeFilters.sources.length + activeFilters.targets.length + activeFilters.types.length + activeFilters.directions.length + activeFilters.dpts.length
     : 0;
 
+  // Inline "buffer full" marker shown next to the count in the stats pill (#284).
+  const bufferLimitWarning = filteredLiveTelegrams.length >= loadLimit ? (
+    <span
+      onClick={() => setIsSettingsOpen(true)}
+      title={`Buffer full (${loadLimit.toLocaleString()}). Click to adjust in settings.`}
+      style={{ display: 'inline-flex', alignItems: 'center', color: '#fbbf24', cursor: 'pointer' }}
+    >
+      <AlertTriangle size={13} />
+    </span>
+  ) : null;
+
   return (
     <div className="container dashboard-grid" style={{ padding: '1.5rem', gap: '1.5rem' }}>
 
@@ -631,11 +642,29 @@ function App() {
                   <span style={{ fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.4rem', color: 'var(--text-dim)' }}>
                     Rate: <span onClick={() => setRateMode(m => m === 's' ? 'm' : m === 'm' ? 'h' : 's')} style={{ color: 'var(--accent-primary)', fontWeight: 600, cursor: 'pointer' }}>{busRate.toFixed(1)}/{rateMode}</span>
                   </span>
-                  <span style={{ fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.4rem', color: 'var(--text-dim)' }}>
-                    Buffer: <span style={{ color: 'var(--text-main)', fontWeight: 500 }}>
+                  <span style={{ fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.35rem', color: 'var(--text-dim)' }}>
+                    Buffer:
+                    {/* Buffer-related actions live with the count (#284): clear + load history */}
+                    <button
+                      className="icon-button"
+                      onClick={() => { void clearTelegrams(); }}
+                      title="Clear (also wipes the local telegram cache)"
+                      style={{ color: 'var(--text-dim)', padding: '0.15rem' }}
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                    <button
+                      className="icon-button"
+                      onClick={() => setIsHistoryLoaderOpen(true)}
+                      title={isHistoryLoading ? 'History read in progress…' : 'Load history'}
+                      style={{ color: isHistoryLoading ? 'var(--accent-primary)' : 'var(--text-dim)', padding: '0.15rem' }}
+                    >
+                      <Download size={15} />
+                    </button>
+                    <span style={{ color: 'var(--text-main)', fontWeight: 500, display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}>
                       {activeFilterCount
-                        ? <>{filteredLiveTelegrams.length}<span style={{ color: 'var(--text-dim)', fontWeight: 400 }}> / {liveTelegrams.length}</span></>
-                        : liveTelegrams.length}
+                        ? <>{filteredLiveTelegrams.length}{bufferLimitWarning}<span style={{ color: 'var(--text-dim)', fontWeight: 400 }}> / {liveTelegrams.length}</span></>
+                        : <>{liveTelegrams.length}{bufferLimitWarning}</>}
                     </span>
                   </span>
                   {isPaused && (
@@ -658,15 +687,6 @@ function App() {
                       style={{ fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.35rem', color: 'var(--error)' }}
                     >
                       <AlertTriangle size={13} /> History: failed
-                    </span>
-                  )}
-                  {filteredLiveTelegrams.length >= loadLimit && (
-                    <span
-                      style={{ fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.35rem', color: '#fbbf24', cursor: 'pointer' }}
-                      onClick={() => setIsSettingsOpen(true)}
-                      title={`Buffer full (${loadLimit.toLocaleString()}). Click to adjust in settings.`}
-                    >
-                      <AlertTriangle size={13} /> Limit reached
                     </span>
                   )}
                 </div>
@@ -741,18 +761,6 @@ function App() {
 
                 <button className="icon-button" onClick={togglePause} title={isPaused ? 'Resume' : 'Pause'}>
                   {isPaused ? <Play size={18} fill="currentColor" /> : <Pause size={18} fill="currentColor" />}
-                </button>
-                <button
-                  className="icon-button"
-                  onClick={() => setIsHistoryLoaderOpen(true)}
-                  title={isHistoryLoading ? 'History read in progress…' : 'Load history'}
-                  style={{ color: isHistoryLoading ? 'var(--accent-primary)' : undefined }}
-                >
-                  <Download size={18} />
-                </button>
-                <div style={{ width: 1, height: 18, background: 'var(--border-color)' }} />
-                <button className="icon-button" onClick={() => { void clearTelegrams(); }} title="Clear (also wipes the local telegram cache)" style={{ color: 'var(--text-dim)' }}>
-                  <Trash2 size={18} />
                 </button>
               </>
             )}
