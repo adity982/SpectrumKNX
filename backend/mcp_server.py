@@ -38,6 +38,8 @@ from knx_telegram_store.mcp import (
     query_telegrams as lib_query_telegrams,
 )
 from mcp.server.fastmcp import FastMCP
+from xknx import mcp as xknx_mcp
+from xknxproject import mcp as xknxproject_mcp
 
 import knx_daemon
 from database import store
@@ -62,6 +64,27 @@ def mcp_status() -> dict[str, Any]:
     return {"mode": mode, "enabled": mcp_enabled(), "write_tools": write_tools_enabled()}
 
 
+def _require_project() -> Any:
+    """The parsed ETS project, or raise if none is loaded.
+
+    Resolved per call so tools pick up a reloaded project without a rebuild.
+    """
+    project = knx_daemon.global_knx_project
+    if project is None:
+        raise ValueError(
+            "No ETS project is loaded. Configure an ETS .knxproj to use project tools."
+        )
+    return project
+
+
+def _require_xknx() -> Any:
+    """The live XKNX instance, or raise if the bus stack is not running."""
+    instance = knx_daemon.xknx_instance
+    if instance is None:
+        raise ValueError("The KNX bus stack is not running.")
+    return instance
+
+
 def _build_server() -> FastMCP:
     # stateless_http keeps each request self-contained — no server-side session
     # state to manage, which is all these read tools need and simplifies mounting.
@@ -78,12 +101,18 @@ def _build_server() -> FastMCP:
         telegram_types: list[str] | None = None,
         directions: list[str] | None = None,
         dpt_mains: list[int] | None = None,
+        dpts: list[str] | None = None,
+        delta_before_ms: int = 0,
+        delta_after_ms: int = 0,
         limit: int = 100,
         offset: int = 0,
         order_descending: bool = True,
     ) -> dict[str, Any]:
         """Search stored KNX telegrams. Times are ISO-8601; address/type/direction
-        filters are lists (OR within a filter, AND across filters)."""
+        filters are lists (OR within a filter, AND across filters). `telegram_types`
+        accepts "Write"/"Read"/"Response" or the full GroupValue* names. `dpts` are
+        "main" or "main.sub" strings (e.g. "9.001"). `delta_before_ms`/`delta_after_ms`
+        add a context window of telegrams around each match."""
         result = await lib_query_telegrams(
             store,
             QueryTelegramsInput(
@@ -94,6 +123,9 @@ def _build_server() -> FastMCP:
                 telegram_types=telegram_types or [],
                 directions=directions or [],
                 dpt_mains=dpt_mains or [],
+                dpts=dpts or [],
+                delta_before_ms=delta_before_ms,
+                delta_after_ms=delta_after_ms,
                 limit=limit,
                 offset=offset,
                 order_descending=order_descending,
@@ -127,6 +159,105 @@ def _build_server() -> FastMCP:
     async def get_server_config() -> dict[str, Any]:
         """SpectrumKNX connection/security configuration (passwords masked)."""
         return knx_daemon.get_server_config()
+
+    # --- ETS project introspection (xknxproject.mcp) --------------------------
+
+    @mcp.tool()
+    async def get_project_info() -> dict[str, Any]:
+        """Loaded ETS project metadata and top-level entity counts."""
+        return asdict(await xknxproject_mcp.get_project_info(_require_project()))
+
+    @mcp.tool()
+    async def list_group_addresses(
+        text: str | None = None,
+        dpts: list[str] | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """List project group addresses. `text` matches address/name/description;
+        `dpts` are "main" or "main.sub" strings (e.g. "9.001")."""
+        result = await xknxproject_mcp.list_group_addresses(
+            _require_project(),
+            xknxproject_mcp.GroupAddressFilter(
+                text=text, dpts=dpts or [], limit=limit, offset=offset
+            ),
+        )
+        return asdict(result)
+
+    @mcp.tool()
+    async def describe_group_address(address: str) -> dict[str, Any]:
+        """Resolve one group address to its communication objects and devices."""
+        return asdict(await xknxproject_mcp.describe_group_address(_require_project(), address))
+
+    @mcp.tool()
+    async def list_devices(
+        text: str | None = None, limit: int = 100, offset: int = 0
+    ) -> dict[str, Any]:
+        """List project devices. `text` matches individual address/name/manufacturer."""
+        result = await xknxproject_mcp.list_devices(
+            _require_project(),
+            xknxproject_mcp.DeviceFilter(text=text, limit=limit, offset=offset),
+        )
+        return asdict(result)
+
+    @mcp.tool()
+    async def list_communication_objects(
+        device_address: str | None = None,
+        group_address: str | None = None,
+        text: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """List communication objects, optionally scoped to a device and/or a
+        linked group address."""
+        result = await xknxproject_mcp.list_communication_objects(
+            _require_project(),
+            xknxproject_mcp.CommunicationObjectFilter(
+                device_address=device_address,
+                group_address=group_address,
+                text=text,
+                limit=limit,
+                offset=offset,
+            ),
+        )
+        return asdict(result)
+
+    @mcp.tool()
+    async def get_topology() -> dict[str, Any]:
+        """Bus topology: areas, their lines and device addresses."""
+        return asdict(await xknxproject_mcp.get_topology(_require_project()))
+
+    @mcp.tool()
+    async def list_locations() -> dict[str, Any]:
+        """Building/location tree (spaces, nested, with devices and functions)."""
+        return asdict(await xknxproject_mcp.list_locations(_require_project()))
+
+    # --- KNX data point types + bus status (xknx.mcp) -------------------------
+
+    @mcp.tool()
+    async def list_dpts(
+        main: int | None = None,
+        text: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """List known KNX data point types. `main` restricts to a DPT main
+        number; `text` matches the DPT number/value type/unit."""
+        result = await xknx_mcp.list_dpts(
+            xknx_mcp.DptFilter(main=main, text=text, limit=limit, offset=offset)
+        )
+        return asdict(result)
+
+    @mcp.tool()
+    async def describe_dpt(dpt: str) -> dict[str, Any]:
+        """Resolve a DPT number ("9.001") or value type name ("temperature") to
+        its definition (value type, unit, numeric bounds)."""
+        return asdict(await xknx_mcp.describe_dpt(dpt))
+
+    @mcp.tool()
+    async def get_connection_status() -> dict[str, Any]:
+        """KNX bus connection state, connection type and local individual address."""
+        return asdict(await xknx_mcp.get_connection_status(_require_xknx()))
 
     return mcp
 
