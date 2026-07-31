@@ -11,7 +11,8 @@ Access is gated by ``MCP_MODE``:
 
 - ``off`` — the endpoint is not mounted.
 - ``read-only`` (default) — query/introspection tools only.
-- ``read-write`` — additionally exposes bus/write tools (added in a later step).
+- ``read-write`` — additionally exposes bus tools that transmit on the KNX
+  bus (live read, GroupValueRead, GroupValueWrite).
 """
 
 import os
@@ -232,6 +233,28 @@ def _build_server() -> FastMCP:
         """Building/location tree (spaces, nested, with devices and functions)."""
         return asdict(await xknxproject_mcp.list_locations(_require_project()))
 
+    @mcp.tool()
+    async def list_functions(
+        text: str | None = None,
+        space_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """List project functions/functional blocks. `text` matches identifier/name/type/usage;
+        `space_id` restricts to a specific space/room."""
+        result = await xknxproject_mcp.list_functions(
+            _require_project(),
+            xknxproject_mcp.FunctionFilter(
+                text=text, space_id=space_id, limit=limit, offset=offset
+            ),
+        )
+        return asdict(result)
+
+    @mcp.tool()
+    async def describe_function(identifier: str) -> dict[str, Any]:
+        """Resolve one function/functional block by identifier to its group address references and roles."""
+        return asdict(await xknxproject_mcp.describe_function(_require_project(), identifier))
+
     # --- KNX data point types + bus status (xknx.mcp) -------------------------
 
     @mcp.tool()
@@ -259,7 +282,74 @@ def _build_server() -> FastMCP:
         """KNX bus connection state, connection type and local individual address."""
         return asdict(await xknx_mcp.get_connection_status(_require_xknx()))
 
+    @mcp.tool()
+    async def encode_value(value: Any, value_type: str) -> dict[str, Any]:
+        """Encode a value using a specific DPT into its raw payload bytes.
+        `value` is the Python native value; `value_type` is DPT number (e.g. "9.001") or name."""
+        result = await xknx_mcp.encode_dpt_payload(
+            xknx_mcp.EncodeDptPayloadInput(value=value, value_type=value_type)
+        )
+        return asdict(result)
+
+    @mcp.tool()
+    async def decode_payload(payload: list[int] | int, value_type: str) -> dict[str, Any]:
+        """Decode raw payload bytes or integer using a specific DPT.
+        `payload` is a list of byte integers, or a single integer for 6-bit DPTs (like 1.001)."""
+        result = await xknx_mcp.decode_dpt_payload(
+            xknx_mcp.DecodeDptPayloadInput(payload=payload, value_type=value_type)
+        )
+        return asdict(result)
+
+    if write_tools_enabled():
+        _register_bus_tools(mcp)
+
     return mcp
+
+
+def _register_bus_tools(mcp: FastMCP) -> None:
+    """Register the bus tools that transmit on the KNX bus.
+
+    Only mounted in ``read-write`` mode: these send telegrams (a live read
+    triggers a GroupValueRead; a write mutates a group address).
+    """
+
+    @mcp.tool()
+    async def read_group_value(
+        group_address: str, value_type: str | None = None
+    ) -> dict[str, Any]:
+        """Read a group address live from the bus (sends a GroupValueRead and
+        waits). `value_type` is a DPT number ("9.001") or value type name
+        ("temperature"); without it the raw payload is returned."""
+        result = await xknx_mcp.read_group_value(
+            _require_xknx(),
+            xknx_mcp.GroupValueReadInput(group_address=group_address, value_type=value_type),
+        )
+        return asdict(result)
+
+    @mcp.tool()
+    async def send_group_value_read(group_address: str) -> dict[str, Any]:
+        """Queue a GroupValueRead telegram to trigger a response on the bus."""
+        result = await xknx_mcp.send_group_value_read(
+            _require_xknx(), xknx_mcp.GroupAddressInput(group_address=group_address)
+        )
+        return asdict(result)
+
+    @mcp.tool()
+    async def send_group_value_write(
+        group_address: str,
+        value: bool | int | float | str | list[int],
+        value_type: str | None = None,
+    ) -> dict[str, Any]:
+        """Write a value to a group address (queues a GroupValueWrite). `value_type`
+        selects the DPT used to encode `value`; without it an int is sent as a
+        6-bit payload and a list of ints as a byte array."""
+        result = await xknx_mcp.send_group_value_write(
+            _require_xknx(),
+            xknx_mcp.GroupValueWriteInput(
+                group_address=group_address, value=value, value_type=value_type
+            ),
+        )
+        return asdict(result)
 
 
 _fastmcp: FastMCP | None = None

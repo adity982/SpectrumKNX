@@ -5,6 +5,8 @@ import pytest_asyncio
 from knx_telegram_store import StoredTelegram
 from knx_telegram_store.backends.memory import MemoryStore
 from xknx import XKNX
+from xknx.dpt import DPTArray
+from xknx.telegram import GroupAddress, Telegram, apci
 
 import knx_daemon
 import mcp_server
@@ -111,7 +113,24 @@ def _sample_project() -> dict:
             }
         },
         "group_ranges": {},
-        "functions": {},
+        "functions": {
+            "F-1": {
+                "function_type": "FT-1",
+                "group_addresses": {
+                    "1/0/0": {
+                        "address": "1/0/0",
+                        "name": "Kitchen Light",
+                        "project_uid": 12,
+                        "role": "SwitchOnOff",
+                    }
+                },
+                "identifier": "F-1",
+                "name": "Kitchen Light Function",
+                "project_uid": 10,
+                "space_id": "B1",
+                "usage_text": "Control kitchen light",
+            }
+        },
     }
 
 
@@ -178,10 +197,14 @@ async def test_lists_read_only_tools(server):
         "list_communication_objects",
         "get_topology",
         "list_locations",
+        "list_functions",
+        "describe_function",
         # DPT catalogue + bus status (xknx.mcp)
         "list_dpts",
         "describe_dpt",
         "get_connection_status",
+        "encode_value",
+        "decode_payload",
     } <= names
 
 
@@ -276,6 +299,18 @@ async def test_project_tools(server, monkeypatch):
     locations = await _structured(server, "list_locations")
     assert locations["spaces"][0]["type"] == "Building"
 
+    functions = await _structured(server, "list_functions", {"text": "kitchen"})
+    assert len(functions["functions"]) == 1
+    assert functions["functions"][0]["identifier"] == "F-1"
+    assert functions["functions"][0]["group_address_count"] == 1
+
+    detail = await _structured(server, "describe_function", {"identifier": "F-1"})
+    assert detail["found"] is True
+    assert detail["function"]["identifier"] == "F-1"
+    assert len(detail["group_addresses"]) == 1
+    assert detail["group_addresses"][0]["role"] == "SwitchOnOff"
+    assert detail["group_addresses"][0]["address"] == "1/0/0"
+
 
 @pytest.mark.asyncio
 async def test_project_tool_without_project_errors(server, monkeypatch):
@@ -299,6 +334,50 @@ async def test_dpt_tools(server):
     assert missing["found"] is False
 
 
+@pytest_asyncio.fixture
+async def rw_server(monkeypatch):
+    """An MCP server built in read-write mode, wired to a seeded store."""
+    store = await _seeded_store()
+    monkeypatch.setattr(mcp_server, "store", store)
+    monkeypatch.setattr(mcp_server, "MCP_MODE", "read-write")
+    return mcp_server._build_server()
+
+
+@pytest.mark.asyncio
+async def test_write_tools_hidden_in_read_only_mode(server):
+    names = {t.name for t in await server.list_tools()}
+    assert {"read_group_value", "send_group_value_read", "send_group_value_write"} & names == set()
+
+
+@pytest.mark.asyncio
+async def test_write_tools_exposed_in_read_write_mode(rw_server):
+    names = {t.name for t in await rw_server.list_tools()}
+    assert {"read_group_value", "send_group_value_read", "send_group_value_write"} <= names
+
+
+@pytest.mark.asyncio
+async def test_send_group_value_write_queues_telegram(rw_server, monkeypatch):
+    xknx = XKNX()
+    monkeypatch.setattr(knx_daemon, "xknx_instance", xknx)
+    result = await _structured(
+        rw_server,
+        "send_group_value_write",
+        {"group_address": "1/2/3", "value": 50, "value_type": "percent"},
+    )
+    assert result["apci"] == "GroupValueWrite"
+    assert xknx.telegrams.get_nowait() == Telegram(
+        destination_address=GroupAddress("1/2/3"),
+        payload=apci.GroupValueWrite(DPTArray((0x80,))),
+    )
+
+
+@pytest.mark.asyncio
+async def test_bus_tools_require_running_stack(rw_server, monkeypatch):
+    monkeypatch.setattr(knx_daemon, "xknx_instance", None)
+    with pytest.raises(Exception):  # noqa: B017, PT011
+        await _structured(rw_server, "send_group_value_read", {"group_address": "1/2/3"})
+
+
 @pytest.mark.asyncio
 async def test_connection_status_tool(server, monkeypatch):
     monkeypatch.setattr(knx_daemon, "xknx_instance", XKNX())
@@ -309,3 +388,18 @@ async def test_connection_status_tool(server, monkeypatch):
     monkeypatch.setattr(knx_daemon, "xknx_instance", None)
     with pytest.raises(Exception):  # noqa: B017, PT011
         await _structured(server, "get_connection_status")
+
+
+@pytest.mark.asyncio
+async def test_encode_decode_value_tools(server):
+    encoded = await _structured(server, "encode_value", {"value": 21.0, "value_type": "9.001"})
+    assert encoded["payload"] == [0x0C, 0x1A]
+    assert encoded["value_type"] == "9.001"
+
+    decoded = await _structured(server, "decode_payload", {"payload": [0x0C, 0x1A], "value_type": "9.001"})
+    assert decoded["value"] == 21.0
+    assert decoded["value_type"] == "9.001"
+
+    decoded_binary = await _structured(server, "decode_payload", {"payload": 1, "value_type": "1.001"})
+    assert decoded_binary["value"] == "on"
+
