@@ -8,6 +8,7 @@ from typing import Any
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
+from knx_telegram_store import TelegramQuery
 from knx_telegram_store.formats import COMMUNICATION_LOG_FOOTER, COMMUNICATION_LOG_HEADER, format_telegram_element
 from pydantic import BaseModel, Field
 from sqlalchemy import text
@@ -20,7 +21,6 @@ import telegram_export
 import telegram_import
 import update_check
 from database import READ_ONLY, engine, store
-from knx_telegram_store import TelegramQuery
 from parsers import (
     format_dpt_name,
     format_value_nicely,
@@ -261,8 +261,8 @@ async def get_filter_options():
 
 def _aggregate_statistics(
     rows: list,
-    ga_name_map: dict[str, str],
-    pa_name_map: dict[str, str],
+    ga_name_map: dict[str, str | None],
+    pa_name_map: dict[str, str | None],
 ) -> dict:
     """Aggregate (source, destination, count) rows into GA/PA totals.
 
@@ -281,9 +281,9 @@ def _aggregate_statistics(
         ga_sources.setdefault(destination, {})[source] = ga_sources.setdefault(destination, {}).get(source, 0) + cnt
         pa_dests.setdefault(source, {})[destination] = pa_dests.setdefault(source, {}).get(destination, 0) + cnt
 
-    def _children(counts: dict[str, int], name_map: dict[str, str]) -> list:
+    def _children(counts: dict[str, int], name_map: dict[str, str | None]) -> list:
         return sorted(
-            [{"address": addr, "name": name_map.get(addr, ""), "count": cnt} for addr, cnt in counts.items()],
+            [{"address": addr, "name": name_map.get(addr) or "", "count": cnt} for addr, cnt in counts.items()],
             key=lambda x: x["count"],
             reverse=True,
         )
@@ -292,7 +292,7 @@ def _aggregate_statistics(
         [
             {
                 "address": addr,
-                "name": ga_name_map.get(addr, ""),
+                "name": ga_name_map.get(addr) or "",
                 "count": cnt,
                 "children": _children(ga_sources.get(addr, {}), pa_name_map),
             }
@@ -305,7 +305,7 @@ def _aggregate_statistics(
         [
             {
                 "address": addr,
-                "name": pa_name_map.get(addr, ""),
+                "name": pa_name_map.get(addr) or "",
                 "count": cnt,
                 "children": _children(pa_dests.get(addr, {}), ga_name_map),
             }
@@ -333,17 +333,11 @@ async def get_statistics():
         result = await conn.execute(sql)
         rows = result.fetchall()
 
-    ga_name_map: dict[str, str] = {}
-    pa_name_map: dict[str, str] = {}
+    ga_name_map: dict[str, str | None] = {}
+    pa_name_map: dict[str, str | None] = {}
     if knx_daemon.global_knx_project:
-        for addr, data in knx_daemon.global_knx_project.get("group_addresses", {}).items():
-            ga_name_map[addr] = data.get("name", "")
-        for addr, data in knx_daemon.global_knx_project.get("devices", {}).items():
-            try:
-                ia_str = str(IndividualAddress(addr))
-            except Exception:
-                ia_str = str(addr)
-            pa_name_map[ia_str] = data.get("name", "")
+        ga_name_map = knx_daemon.project_name_map.get("ga", {})
+        pa_name_map = knx_daemon.project_name_map.get("ia", {})
 
     return _aggregate_statistics(rows, ga_name_map, pa_name_map)
 
