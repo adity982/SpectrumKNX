@@ -1,3 +1,4 @@
+import asyncio
 import dataclasses
 import os
 import subprocess
@@ -589,7 +590,9 @@ def _build_device(addr: str, device: dict, cos: dict, gas: dict) -> dict:
 
 def _build_space(space: dict, devices: dict, cos: dict, gas: dict, functions_dict: dict) -> dict:
     """Recursively serialize a building space with nested spaces, devices, and functions."""
-    child_spaces = [_build_space(sub, devices, cos, gas, functions_dict) for sub in (space.get("spaces") or {}).values()]
+    child_spaces = [
+        _build_space(sub, devices, cos, gas, functions_dict) for sub in (space.get("spaces") or {}).values()
+    ]
     device_nodes = [
         _build_device(dev_addr, devices[dev_addr], cos, gas)
         for dev_addr in space.get("devices") or []
@@ -606,24 +609,31 @@ def _build_space(space: dict, devices: dict, cos: dict, gas: dict, functions_dic
                 dpt = ga_master.get("dpt")
                 # The function ref's own name is empty and its "role" is an opaque
                 # UUID; resolve the real GA name + DPT from the project (#295).
-                group_addresses.append({
-                    "address": ga_addr,
-                    "name": ga_master.get("name") or ga_ref.get("name", ""),
-                    "dpts": (
-                        [{
-                            "main": dpt.get("main"),
-                            "sub": dpt.get("sub"),
-                            "name": format_dpt_name(dpt.get("main"), dpt.get("sub"))[0],
-                        }]
-                        if dpt else []
-                    ),
-                })
-            space_functions.append({
-                "id": func_id,
-                "name": func.get("name", ""),
-                "type": func.get("function_type", ""),
-                "group_addresses": group_addresses
-            })
+                group_addresses.append(
+                    {
+                        "address": ga_addr,
+                        "name": ga_master.get("name") or ga_ref.get("name", ""),
+                        "dpts": (
+                            [
+                                {
+                                    "main": dpt.get("main"),
+                                    "sub": dpt.get("sub"),
+                                    "name": format_dpt_name(dpt.get("main"), dpt.get("sub"))[0],
+                                }
+                            ]
+                            if dpt
+                            else []
+                        ),
+                    }
+                )
+            space_functions.append(
+                {
+                    "id": func_id,
+                    "name": func.get("name", ""),
+                    "type": func.get("function_type", ""),
+                    "group_addresses": group_addresses,
+                }
+            )
 
     return {
         "kind": "space",
@@ -725,16 +735,18 @@ async def upload_project(file: UploadFile = File(...), password: str = Form(""))
 
     proj_file, pwd_file = _project_upload_path()
 
-    os.makedirs(os.path.dirname(proj_file), exist_ok=True)
-
     content = await file.read()
 
-    try:
+    def save_project_files():
+        os.makedirs(os.path.dirname(proj_file), exist_ok=True)
         with open(proj_file, "wb") as f:
             f.write(content)
         if pwd_file:
             with open(pwd_file, "w", encoding="utf-8") as f:
                 f.write(password)
+
+    try:
+        await asyncio.to_thread(save_project_files)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=f"Cannot write project file: {e}") from e
 
@@ -790,16 +802,21 @@ async def upload_knxkeys(file: UploadFile = File(...), password: str = Form(""))
         raise HTTPException(status_code=400, detail="File must be a .knxkeys file")
 
     default_dir = "/project"
-    os.makedirs(default_dir, exist_ok=True)
-
     content = await file.read()
 
-    with open(knx_daemon.DEFAULT_KNXKEYS_FILE, "wb") as f:
-        f.write(content)
+    def save_knxkeys_files():
+        os.makedirs(default_dir, exist_ok=True)
+        with open(knx_daemon.DEFAULT_KNXKEYS_FILE, "wb") as f:
+            f.write(content)
 
-    if password:
-        with open(knx_daemon.DEFAULT_KNXKEYS_PASSWORD_FILE, "w", encoding="utf-8") as f:
-            f.write(password)
+        if password:
+            with open(knx_daemon.DEFAULT_KNXKEYS_PASSWORD_FILE, "w", encoding="utf-8") as f:
+                f.write(password)
+
+    try:
+        await asyncio.to_thread(save_knxkeys_files)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=f"Cannot write KNX keys file: {e}") from e
 
     # Trigger reconnection with new credentials
     await knx_daemon._reconnect_knx()
