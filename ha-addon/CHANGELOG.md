@@ -1,5 +1,73 @@
 # Changelog
 
+## 2.0.0-beta.6
+
+### Added
+
+- **Building Structure readability**: shared group-address table with row-hover highlighting, project-wide name-column alignment, and blank Time/Value cells for GAs never seen on the bus; function-type names, DPT-mismatch detection between linked group addresses, a comm-object summary row, and visualize icons throughout (#306, #307).
+- **Telegram List overhaul**: multi-level sorting, an always-on delta-time column, and a quick info bar (oldest/newest, min/max delta, jump-to-row); redesigned quick filter with per-column pattern matching and a DELTA TIME quick-filter cell (#311, #309).
+- **Time-Delta-Context**: switchable on/off without losing the entered before/after values, per-message flagging so a specific telegram always anchors its own context window, and clear visual marking of filtered vs. unfiltered context rows in the list (#318, #319, #343).
+- **Visualization improvements**: crowded charts get hover highlighting, a collapsible fixed legend, and a per-metric "lock" that spawns a new chart instead of piling more lines onto one; the pan & zoom timeline now sits above the charts and pins to the live edge as the buffer grows; clicking a point on a chart's timeline jumps back to the telegram list centered on that time; group addresses with unchartable values (e.g. text/DPT16) now render as discrete, labeled event dots instead of a blank chart (#349, #308, #341).
+- **Cross-navigation icons**: write-to-GA, add-to-filter, visualize, and last-seen-values icons throughout the Visualization Targets sidebar and the Last Seen Values pane, including on the "other kind" address (device or GA) shown in each telegram's row (#341).
+
+### Fixed
+
+- **Write to bus**: sending an empty value to a DPT 16/28 (string) group address was blocked by the Write button, even though an empty string is a valid payload for clearing a text display (#410).
+- **Database purge**: "purge telegrams before a date" used UTC midnight instead of the server's local midnight as the cutoff, deleting (or keeping) a couple of hours' worth of telegrams the selected date didn't intend (#416).
+
+## 2.0.0-beta.5
+
+### Added
+
+- **Shared PostgreSQL companion mode**: New `STORE_MODE=postgres-readonly` reads a PostgreSQL database owned and written by another process (e.g. Home Assistant's KNX integration), with live updates via PostgreSQL `LISTEN`/`NOTIFY` instead of polling. Unlike the existing sqlite companion mode, the KNX daemon still connects to the bus for outbound writes; it never writes telegrams itself in this mode.
+
+### Changed
+
+- **Performance**: Offloaded blocking file I/O (project/knxkeys uploads) to a thread pool so it no longer stalls the async event loop.
+- **Performance**: `get_statistics` reuses precomputed project name maps instead of rebuilding them on every request.
+
+### Fixed
+
+- **Security**: Restricted CORS to specific configured origins instead of allowing `*` together with credentials.
+
+## 2.0.0-beta.4
+
+### Changed
+
+- **MCP Context Optimization**: Removed high-cardinality project resources (`group-addresses`, `devices`, `topology`, `locations`, `functions`) to prevent LLM context bloat. Kept lightweight `knx://project` overview index and updated canned prompts to instruct agents to use paginated discovery tools.
+
+## 2.0.0-beta.3
+
+### Fixed
+
+- **MCP Transport Security**: Configured FastMCP transport security settings to allow network clients and custom Host headers without 421 Misdirected Request errors.
+
+## 2.0.0-beta.2
+
+### Added
+
+- **MCP Server Integration**: Introduces Model Context Protocol (MCP) server endpoints at `/mcp`. Allows external AI assistants to read and write to the KNX bus, explore ETS projects, filter telegrams, list group addresses, and query active data.
+- **Frontend Revamp App-Shell**: Implements a new five-panel layout switch for the frontend, providing a streamlined and modern navigation experience.
+- **Simplified Filter Pane**: Adds an edit/active toggle view to simplify filter configuration.
+- **DPT Override in Write-to-Bus**: Allows users to manually override Datapoint Types (DPT) directly in the Write-to-Bus panel.
+- **Session State Persistence**: Automatically persists the active session UI state across navigation and browser updates.
+- **Focused Telegram Highlighting**: Highlights/marks the focused rows in the telegram list for improved readability.
+- **Numerical Sorting**: Sorts group and physical addresses numerically in the Last Seen Values panel.
+- **Visualization Panel Header Controls**: Added a header close X control to the Visualization panel, and repurposed the Targets list X to clear targets.
+
+### Changed
+
+- **Visualization Chart Alignment**: Aligns chart borders, moves the timeline legend to the left, and prevents scale clipping when zooming or panning.
+- **Visualization Persistence**: Keeps charts on-screen automatically as the history/live buffer grows.
+- **Docker Build Optimization**: Bundles git within the backend Docker image to ensure `docker compose --build` runs successfully.
+- **xknx Update**: Upgraded xknx to 3.17.0.
+
+### Fixed
+
+- **History Load Cancellation**: Cancels any in-flight background history loading tasks when the buffer is cleared.
+- **History Buffer Gaps**: Fixed a bug where permanent time gaps could form in the async history buffer.
+- **History Search Timezone Offset**: Fixed timezone offset errors when specifying custom date ranges in history search.
+
 ## 1.16.2
 
 ### Added

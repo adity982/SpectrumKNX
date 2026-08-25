@@ -1,5 +1,19 @@
 import { describe, expect, test } from 'vitest';
-import { DEFAULT_FILTERS, dptKey, matchesDpt, matchesTelegram } from './filters';
+import { DEFAULT_FILTERS, dptKey, effectiveDeltaContext, matchesDpt, matchesTelegram } from './filters';
+
+describe('effectiveDeltaContext', () => {
+  test('returns the stored before/after values when enabled', () => {
+    const f = { ...DEFAULT_FILTERS, deltaBeforeMs: 500, deltaAfterMs: 250, deltaContextEnabled: true };
+    expect(effectiveDeltaContext(f)).toEqual({ before: 500, after: 250 });
+  });
+
+  test('zeroes the effective window when disabled, without touching the stored values (#318)', () => {
+    const f = { ...DEFAULT_FILTERS, deltaBeforeMs: 500, deltaAfterMs: 250, deltaContextEnabled: false };
+    expect(effectiveDeltaContext(f)).toEqual({ before: 0, after: 0 });
+    expect(f.deltaBeforeMs).toBe(500); // re-enabling would restore these, not lose them
+    expect(f.deltaAfterMs).toBe(250);
+  });
+});
 
 describe('dptKey', () => {
   test('pads the sub to three digits', () => {
@@ -70,5 +84,22 @@ describe('matchesTelegram direction filtering (#194)', () => {
   test('telegrams without a direction pass only when unfiltered', () => {
     expect(matchesTelegram(undirected, DEFAULT_FILTERS)).toBe(true);
     expect(matchesTelegram(undirected, { ...DEFAULT_FILTERS, directions: ['Incoming'] })).toBe(false);
+  });
+});
+
+describe('matchesTelegram source/target combination (#275)', () => {
+  const t = { source_address: '1.2.3', target_address: '0/1/2', simplified_type: 'Write' };
+
+  test('source and target always combine with AND', () => {
+    const f = { ...DEFAULT_FILTERS, sources: ['1.2.3'], targets: ['0/1/2'] };
+    expect(matchesTelegram(t, f)).toBe(true);
+    expect(matchesTelegram({ ...t, target_address: '9/9/9' }, f)).toBe(false);
+    expect(matchesTelegram({ ...t, source_address: '9.9.9' }, f)).toBe(false);
+  });
+
+  test('legacy sourceTargetRelation="OR" is ignored and applied as AND', () => {
+    const legacy = { ...DEFAULT_FILTERS, sources: ['1.2.3'], targets: ['0/1/2'], sourceTargetRelation: 'OR' as const };
+    expect(matchesTelegram({ ...t, target_address: '9/9/9' }, legacy)).toBe(false);
+    expect(matchesTelegram(t, legacy)).toBe(true);
   });
 });

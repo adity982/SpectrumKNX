@@ -1,11 +1,12 @@
+import json
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
+from knx_telegram_store import StoredTelegram, TelegramQueryResult
 
 import knx_daemon
 from api import _aggregate_statistics
-from knx_telegram_store import StoredTelegram, TelegramQueryResult
 from main import app
 
 client = TestClient(app)
@@ -107,11 +108,12 @@ def test_get_building_with_project():
             "Func-1": {
                 "name": "Dimming Light",
                 "function_type": "Dimming",
+                "usage_text": "Licht dimmen",
                 "group_addresses": {
                     # As in real projects: the function ref carries no name and an
                     # opaque UUID role — the real name/DPT come from the project (#295).
                     "1/2/3": {"name": "", "role": "98139557-C86A-4134-AB91-325CF8ECFC2A"}
-                }
+                },
             }
         },
         "devices": {
@@ -167,6 +169,7 @@ def test_get_building_with_project():
     assert func["id"] == "Func-1"
     assert func["name"] == "Dimming Light"
     assert func["type"] == "Dimming"
+    assert func["type_name"] == "Licht dimmen"  # resolved by xknxproject from ETS master data (#307)
     ga = func["group_addresses"][0]
     assert ga["address"] == "1/2/3"
     assert ga["name"] == "Light On/Off"  # resolved from the project, not the empty ref (#295)
@@ -182,7 +185,13 @@ def test_get_building_with_project():
     assert len(device["channels"]) == 1
     assert device["channels"][0]["name"] == "Channel A"
     assert device["channels"][0]["kos"][0]["number"] == 1
-    assert device["channels"][0]["kos"][0]["group_addresses"][0] == {"address": "1/2/3", "name": "Light On/Off"}
+    assert device["channels"][0]["kos"][0]["group_addresses"][0] == {
+        "address": "1/2/3",
+        "name": "Light On/Off",
+        # Each GA's own DPT, resolved from the project (#307) — may differ from
+        # the KO's own declared DPT even within the same main category.
+        "dpt": {"main": 1, "sub": 1, "name": "1.001 - Switch"},
+    }
     # DPTs carry a resolved descriptive name for the building view (#160).
     assert device["channels"][0]["kos"][0]["dpts"] == [{"main": 1, "sub": 1, "name": "1.001 - Switch"}]
     assert len(device["kos"]) == 1
@@ -575,6 +584,50 @@ def test_upload_project_with_env_path(monkeypatch, tmp_path):
     # Password sidecar written next to the project file
     pwd_file = tmp_path / "my_password"
     assert pwd_file.read_text() == "test_pass"
+
+
+def test_upload_project_records_original_filename(monkeypatch, tmp_path):
+    """The uploaded name is kept in a sidecar so the settings screen can show it
+    instead of the fixed path we store every project under (#425)."""
+    proj_file = tmp_path / "my.knxproj"
+    monkeypatch.setenv("KNX_PROJECT_PATH", str(proj_file))
+    monkeypatch.delenv("KNX_PASSWORD", raising=False)
+
+    async def mock_load():
+        knx_daemon.global_knx_project = {"fake": "project"}
+        return True
+
+    monkeypatch.setattr(knx_daemon, "_load_project_data", mock_load)
+
+    response = client.post(
+        "/api/project/upload", data={"password": ""}, files={"file": ("Home-v42.knxproj", b"dummy_content")}
+    )
+    assert response.status_code == 200
+
+    meta = json.loads((tmp_path / "my_meta.json").read_text())
+    assert meta["original_filename"] == "Home-v42.knxproj"
+    assert meta["imported_at"]
+
+
+def test_upload_project_failure_removes_stale_metadata(monkeypatch, tmp_path):
+    """A sidecar left from an earlier upload must not outlive the project it
+    describes, or the settings screen would name a file that is gone."""
+    proj_file = tmp_path / "my.knxproj"
+    meta_file = tmp_path / "my_meta.json"
+    meta_file.write_text('{"original_filename": "Old.knxproj", "imported_at": "2026-01-01T00:00:00+00:00"}')
+    monkeypatch.setenv("KNX_PROJECT_PATH", str(proj_file))
+    monkeypatch.delenv("KNX_PASSWORD", raising=False)
+
+    async def mock_load_fails():
+        return False
+
+    monkeypatch.setattr(knx_daemon, "_load_project_data", mock_load_fails)
+
+    response = client.post(
+        "/api/project/upload", data={"password": "wrong"}, files={"file": ("New.knxproj", b"dummy_content")}
+    )
+    assert response.status_code == 400
+    assert not meta_file.exists()
 
 
 def test_upload_project_invalid_file(monkeypatch):

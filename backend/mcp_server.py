@@ -11,13 +11,15 @@ Access is gated by ``MCP_MODE``:
 
 - ``off`` — the endpoint is not mounted.
 - ``read-only`` (default) — query/introspection tools only.
-- ``read-write`` — additionally exposes bus/write tools (added in a later step).
+- ``read-write`` — additionally exposes bus tools that transmit on the KNX
+  bus (live read, GroupValueRead, GroupValueWrite).
 """
 
 import json
 import os
-from dataclasses import asdict
-from typing import Any
+from collections.abc import Callable
+from dataclasses import asdict, fields
+from typing import Annotated, Any
 
 from knx_telegram_store.mcp import (
     LastValuesInput,
@@ -38,7 +40,11 @@ from knx_telegram_store.mcp import (
 from knx_telegram_store.mcp import (
     query_telegrams as lib_query_telegrams,
 )
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import Field
+from xknx import mcp as xknx_mcp
+from xknxproject import mcp as xknxproject_mcp
 
 import knx_daemon
 from database import store
@@ -62,6 +68,50 @@ Key concepts:
 Use project resources for installation structure and history tools for stored
 telegrams, statistics, and last-known values. Bus write tools are available
 only when the server is explicitly configured in read-write mode."""
+
+# Shared domain primer prepended to the canned prompts so an agent has KNX context
+# even on a fresh conversation.
+_KNX_CONTEXT = """\
+You are working with a KNX building-automation installation via SpectrumKNX's MCP \
+tools and resources. Key concepts:
+- Group addresses (GAs, e.g. "1/2/3") are communication endpoints; each carries a \
+Data Point Type (DPT, e.g. 9.001 = temperature in °C) defining its value format.
+- Devices have individual addresses (IAs, e.g. "1.1.5"); their communication objects \
+link to GAs.
+- Telegrams are bus messages (GroupValueWrite / GroupValueRead / GroupValueResponse).
+- The loaded ETS project defines the topology, locations and functions that group \
+related GAs.
+
+Use the `knx://project` resource for a high-level project overview, and use discovery tools \
+for searching and inspecting details:
+- `list_group_addresses` and `describe_group_address` to find/inspect GAs.
+- `list_devices` and `list_communication_objects` for devices and hardware.
+- `list_locations`, `list_functions`, and `get_topology` for building structure & functions.
+- `list_dpts` and `describe_dpt` for DPT definitions.
+- `query_telegrams`, `get_store_stats`, `get_last_values` for stored bus telegrams.
+Bus write tools exist only when the server is configured in read-write mode.
+
+When analysing a period, bound `query_telegrams` with `start_time`/`end_time` rather than \
+raising `limit`, and check `limit_reached` in the result — it means you received only part \
+of the range and must page with `next_offset` or narrow the range before concluding \
+anything. Use `get_store_stats` to see the time range the store actually covers."""
+
+
+def _project_overview() -> str:
+    """A compact index of the loaded ETS project: metadata + per-section counts."""
+    project = knx_daemon.global_knx_project
+    if not project:
+        return json.dumps({"status": "no_project_loaded"})
+    sections = ("group_addresses", "devices", "topology", "locations", "functions")
+    return json.dumps(
+        {
+            "status": "ok",
+            "info": project.get("info", {}),
+            "counts": {name: len(project.get(name) or {}) for name in sections},
+        },
+        default=str,
+        sort_keys=True,
+    )
 
 
 def mcp_enabled() -> bool:
@@ -100,6 +150,96 @@ def _build_server() -> FastMCP:
     # streamable_http_path="/" so that mounting the app at "/mcp" serves the
     # endpoint at "/mcp" rather than the doubled-up "/mcp/mcp".
     mcp = FastMCP("spectrum-knx", stateless_http=True, streamable_http_path="/")
+def _require_project() -> Any:
+    """The parsed ETS project, or raise if none is loaded.
+
+    Resolved per call so tools pick up a reloaded project without a rebuild.
+    """
+    project = knx_daemon.global_knx_project
+    if project is None:
+        raise ValueError("No ETS project is loaded. Configure an ETS .knxproj to use project tools.")
+    return project
+
+
+def _require_xknx() -> Any:
+    """The live XKNX instance, or raise if the bus stack is not running."""
+    instance = knx_daemon.xknx_instance
+    if instance is None:
+        raise ValueError("The KNX bus stack is not running.")
+    return instance
+
+
+def _describe(*input_types: type, **overrides: str) -> Callable[[Callable], Callable]:
+    """Attach parameter descriptions to a tool from library dataclass metadata.
+
+    The shared ``*.mcp`` input dataclasses carry each field's description as
+    ``dataclasses.field`` metadata. MCPServer only surfaces per-parameter
+    descriptions from ``Annotated[..., pydantic.Field(description=...)]`` in the
+    signature, so this decorator rewrites the wrapper's annotations in place —
+    matching parameter names to fields — instead of duplicating the text here.
+    ``overrides`` supplies descriptions for ad-hoc parameters that are not backed
+    by a dataclass field. Applied *below* ``@mcp.tool()`` so it runs first.
+    """
+    descriptions: dict[str, str] = {}
+    for input_type in input_types:
+        for field in fields(input_type):
+            description = field.metadata.get("description")
+            if description:
+                descriptions.setdefault(field.name, description)
+    descriptions.update(overrides)
+
+    def decorator(func: Callable) -> Callable:
+        hints = dict(func.__annotations__)
+        for name, description in descriptions.items():
+            if name in hints:
+                hints[name] = Annotated[hints[name], Field(description=description)]
+        func.__annotations__ = hints
+        return func
+
+    return decorator
+
+
+def _build_server() -> MCPServer:
+    # Transport options are not constructor arguments — they are passed to
+    # streamable_http_app() in get_asgi_app() below (mcp 2.0 moved them).
+    mcp = MCPServer("spectrum-knx")
+
+    # ── Project resource ────────────────────────────────────────────────────────
+    # A lightweight index overview of the loaded ETS project. Degrades to a stable
+    # {"status": "no_project_loaded"} payload when no project is configured.
+
+    @mcp.resource(
+        "knx://project",
+        name="ETS project overview",
+        description="Loaded ETS project metadata and per-section object counts.",
+        mime_type="application/json",
+    )
+    def project_overview() -> str:
+        return _project_overview()
+
+    # ── Canned prompts (#335) ───────────────────────────────────────────────────
+
+    @mcp.prompt()
+    def analyze_bus_traffic(hours: int = 1) -> str:
+        """Analyze recent KNX traffic for volume, noisy addresses and unusual values."""
+        return (
+            f"{_KNX_CONTEXT}\n\n"
+            f"Analyze KNX bus traffic from the last {hours} hour(s). Use `query_telegrams`, "
+            "`count_telegrams` and `get_store_stats`. Summarize traffic volume, the busiest "
+            "sources and destinations, repeated or unusual values, and actionable anomalies. "
+            "Do not send or modify bus values."
+        )
+
+    @mcp.prompt()
+    def find_group_addresses_without_dpts() -> str:
+        """Find ETS group addresses that have no assigned DPT."""
+        return (
+            f"{_KNX_CONTEXT}\n\n"
+            "Use the `list_group_addresses` tool to search and list group addresses in the project. "
+            "Find every group address with no assigned DPT. Group the results by project range or function "
+            "where that metadata is available. Do not infer a DPT; suggest candidates separately and state "
+            "what evidence (e.g. observed telegram payloads from `query_telegrams`) would confirm them."
+        )
 
     @mcp.resource(
         "knx://project",
@@ -169,6 +309,7 @@ def _build_server() -> FastMCP:
         )
 
     @mcp.tool()
+    @_describe(QueryTelegramsInput)
     async def query_telegrams(
         start_time: str | None = None,
         end_time: str | None = None,
@@ -177,12 +318,34 @@ def _build_server() -> FastMCP:
         telegram_types: list[str] | None = None,
         directions: list[str] | None = None,
         dpt_mains: list[int] | None = None,
+        dpts: list[str] | None = None,
+        delta_before_ms: int = 0,
+        delta_after_ms: int = 0,
         limit: int = 100,
         offset: int = 0,
         order_descending: bool = True,
     ) -> dict[str, Any]:
-        """Search stored KNX telegrams. Times are ISO-8601; address/type/direction
-        filters are lists (OR within a filter, AND across filters)."""
+        """Search stored KNX telegrams over a time range.
+
+        To analyse a period, bound it with `start_time`/`end_time` (ISO-8601) —
+        that is the correct way to ask for "everything between X and Y", not a
+        larger `limit`.
+
+        IMPORTANT — the result may be partial. `limit` (default 100) is applied
+        *within* the requested range, and results are ordered newest-first by
+        default (`order_descending`), so a plain time-range query returns the
+        *newest* `limit` telegrams in that range, not the whole range. On a busy
+        bus 100 telegrams can be a couple of minutes. Always check
+        `limit_reached` in the result: when it is true you are looking at a
+        subset and must either page with `next_offset` (pass it as `offset`) or
+        narrow the range before drawing conclusions. `total_count` reports how
+        many telegrams match the filters overall.
+
+        Address/type/direction filters are lists (OR within a filter, AND across
+        filters). `telegram_types` accepts "Write"/"Read"/"Response" or the full
+        GroupValue* names. `dpts` are "main" or "main.sub" strings (e.g.
+        "9.001"). `delta_before_ms`/`delta_after_ms` add a context window of
+        telegrams around each match."""
         result = await lib_query_telegrams(
             store,
             QueryTelegramsInput(
@@ -193,6 +356,9 @@ def _build_server() -> FastMCP:
                 telegram_types=telegram_types or [],
                 directions=directions or [],
                 dpt_mains=dpt_mains or [],
+                dpts=dpts or [],
+                delta_before_ms=delta_before_ms,
+                delta_after_ms=delta_after_ms,
                 limit=limit,
                 offset=offset,
                 order_descending=order_descending,
@@ -201,6 +367,7 @@ def _build_server() -> FastMCP:
         return asdict(result)
 
     @mcp.tool()
+    @_describe(LastValuesInput)
     async def get_last_values(destinations: list[str] | None = None) -> dict[str, Any]:
         """Most recent telegram for each group address (optionally filtered to
         the given destinations)."""
@@ -227,19 +394,218 @@ def _build_server() -> FastMCP:
         """SpectrumKNX connection/security configuration (passwords masked)."""
         return knx_daemon.get_server_config()
 
+    # --- ETS project introspection (xknxproject.mcp) --------------------------
+
+    @mcp.tool()
+    async def get_project_info() -> dict[str, Any]:
+        """Loaded ETS project metadata and top-level entity counts."""
+        return asdict(await xknxproject_mcp.get_project_info(_require_project()))
+
+    @mcp.tool()
+    @_describe(xknxproject_mcp.GroupAddressFilter)
+    async def list_group_addresses(
+        text: str | None = None,
+        dpts: list[str] | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """List project group addresses. `text` matches address/name/description;
+        `dpts` are "main" or "main.sub" strings (e.g. "9.001")."""
+        result = await xknxproject_mcp.list_group_addresses(
+            _require_project(),
+            xknxproject_mcp.GroupAddressFilter(text=text, dpts=dpts or [], limit=limit, offset=offset),
+        )
+        return asdict(result)
+
+    @mcp.tool()
+    @_describe(address='Group address to resolve, e.g. "1/2/3".')
+    async def describe_group_address(address: str) -> dict[str, Any]:
+        """Resolve one group address to its communication objects and devices."""
+        return asdict(await xknxproject_mcp.describe_group_address(_require_project(), address))
+
+    @mcp.tool()
+    @_describe(xknxproject_mcp.DeviceFilter)
+    async def list_devices(text: str | None = None, limit: int = 100, offset: int = 0) -> dict[str, Any]:
+        """List project devices. `text` matches individual address/name/manufacturer."""
+        result = await xknxproject_mcp.list_devices(
+            _require_project(),
+            xknxproject_mcp.DeviceFilter(text=text, limit=limit, offset=offset),
+        )
+        return asdict(result)
+
+    @mcp.tool()
+    @_describe(xknxproject_mcp.CommunicationObjectFilter)
+    async def list_communication_objects(
+        device_address: str | None = None,
+        group_address: str | None = None,
+        text: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """List communication objects, optionally scoped to a device and/or a
+        linked group address."""
+        result = await xknxproject_mcp.list_communication_objects(
+            _require_project(),
+            xknxproject_mcp.CommunicationObjectFilter(
+                device_address=device_address,
+                group_address=group_address,
+                text=text,
+                limit=limit,
+                offset=offset,
+            ),
+        )
+        return asdict(result)
+
+    @mcp.tool()
+    async def get_topology() -> dict[str, Any]:
+        """Bus topology: areas, their lines and device addresses."""
+        return asdict(await xknxproject_mcp.get_topology(_require_project()))
+
+    @mcp.tool()
+    async def list_locations() -> dict[str, Any]:
+        """Building/location tree (spaces, nested, with devices and functions)."""
+        return asdict(await xknxproject_mcp.list_locations(_require_project()))
+
+    @mcp.tool()
+    @_describe(xknxproject_mcp.FunctionFilter)
+    async def list_functions(
+        text: str | None = None,
+        space_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """List project functions/functional blocks. `text` matches identifier/name/type/usage;
+        `space_id` restricts to a specific space/room."""
+        result = await xknxproject_mcp.list_functions(
+            _require_project(),
+            xknxproject_mcp.FunctionFilter(text=text, space_id=space_id, limit=limit, offset=offset),
+        )
+        return asdict(result)
+
+    @mcp.tool()
+    @_describe(identifier="Function/functional-block identifier to resolve.")
+    async def describe_function(identifier: str) -> dict[str, Any]:
+        """Resolve one function/functional block by identifier to its group address references and roles."""
+        return asdict(await xknxproject_mcp.describe_function(_require_project(), identifier))
+
+    # --- KNX data point types + bus status (xknx.mcp) -------------------------
+
+    @mcp.tool()
+    @_describe(xknx_mcp.DptFilter)
+    async def list_dpts(
+        main: int | None = None,
+        text: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """List known KNX data point types. `main` restricts to a DPT main
+        number; `text` matches the DPT number/value type/unit."""
+        result = await xknx_mcp.list_dpts(xknx_mcp.DptFilter(main=main, text=text, limit=limit, offset=offset))
+        return asdict(result)
+
+    @mcp.tool()
+    @_describe(dpt='DPT number ("9.001") or value type name ("temperature") to resolve.')
+    async def describe_dpt(dpt: str) -> dict[str, Any]:
+        """Resolve a DPT number ("9.001") or value type name ("temperature") to
+        its definition (value type, unit, numeric bounds)."""
+        return asdict(await xknx_mcp.describe_dpt(dpt))
+
+    @mcp.tool()
+    async def get_connection_status() -> dict[str, Any]:
+        """KNX bus connection state, connection type and local individual address."""
+        return asdict(await xknx_mcp.get_connection_status(_require_xknx()))
+
+    @mcp.tool()
+    @_describe(xknx_mcp.EncodeDptPayloadInput)
+    async def encode_value(value: Any, value_type: str) -> dict[str, Any]:
+        """Encode a value using a specific DPT into its raw payload bytes.
+        `value` is the Python native value; `value_type` is DPT number (e.g. "9.001") or name."""
+        result = await xknx_mcp.encode_dpt_payload(xknx_mcp.EncodeDptPayloadInput(value=value, value_type=value_type))
+        return asdict(result)
+
+    @mcp.tool()
+    @_describe(xknx_mcp.DecodeDptPayloadInput)
+    async def decode_payload(payload: list[int] | int, value_type: str) -> dict[str, Any]:
+        """Decode raw payload bytes or integer using a specific DPT.
+        `payload` is a list of byte integers, or a single integer for 6-bit DPTs (like 1.001)."""
+        result = await xknx_mcp.decode_dpt_payload(
+            xknx_mcp.DecodeDptPayloadInput(payload=payload, value_type=value_type)
+        )
+        return asdict(result)
+
+    if write_tools_enabled():
+        _register_bus_tools(mcp)
+
     return mcp
 
 
-_fastmcp: FastMCP | None = None
+def _register_bus_tools(mcp: MCPServer) -> None:
+    """Register the bus tools that transmit on the KNX bus.
+
+    Only mounted in ``read-write`` mode: these send telegrams (a live read
+    triggers a GroupValueRead; a write mutates a group address).
+    """
+
+    @mcp.tool()
+    @_describe(xknx_mcp.GroupValueReadInput)
+    async def read_group_value(group_address: str, value_type: str | None = None) -> dict[str, Any]:
+        """Read a group address live from the bus (sends a GroupValueRead and
+        waits). `value_type` is a DPT number ("9.001") or value type name
+        ("temperature"); without it the raw payload is returned."""
+        result = await xknx_mcp.read_group_value(
+            _require_xknx(),
+            xknx_mcp.GroupValueReadInput(group_address=group_address, value_type=value_type),
+        )
+        return asdict(result)
+
+    @mcp.tool()
+    @_describe(xknx_mcp.GroupAddressInput)
+    async def send_group_value_read(group_address: str) -> dict[str, Any]:
+        """Queue a GroupValueRead telegram to trigger a response on the bus."""
+        result = await xknx_mcp.send_group_value_read(
+            _require_xknx(), xknx_mcp.GroupAddressInput(group_address=group_address)
+        )
+        return asdict(result)
+
+    @mcp.tool()
+    @_describe(xknx_mcp.GroupValueWriteInput)
+    async def send_group_value_write(
+        group_address: str,
+        value: bool | int | float | str | list[int],
+        value_type: str | None = None,
+    ) -> dict[str, Any]:
+        """Write a value to a group address (queues a GroupValueWrite). `value_type`
+        selects the DPT used to encode `value`; without it an int is sent as a
+        6-bit payload and a list of ints as a byte array."""
+        result = await xknx_mcp.send_group_value_write(
+            _require_xknx(),
+            xknx_mcp.GroupValueWriteInput(group_address=group_address, value=value, value_type=value_type),
+        )
+        return asdict(result)
+
+
+_fastmcp: MCPServer | None = None
 _asgi_app: Any = None
 
 
 def get_asgi_app() -> Any:
-    """The Streamable HTTP ASGI app to mount, built once on first use."""
+    """The Streamable HTTP ASGI app to mount, built once on first use.
+
+    ``streamable_http_path="/"`` so that mounting this app at "/mcp" serves the
+    endpoint at "/mcp" rather than the doubled-up "/mcp/mcp" — the default is
+    "/mcp", which would double it (#332). ``stateless_http`` keeps each request
+    self-contained: no server-side session state to manage, which is all these
+    read tools need and simplifies mounting. Disabling DNS-rebinding protection
+    allows remote network clients and custom Host headers.
+    """
     global _fastmcp, _asgi_app
     if _asgi_app is None:
         _fastmcp = _build_server()
-        _asgi_app = _fastmcp.streamable_http_app()
+        _asgi_app = _fastmcp.streamable_http_app(
+            streamable_http_path="/",
+            stateless_http=True,
+            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+        )
     return _asgi_app
 
 

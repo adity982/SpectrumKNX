@@ -1,12 +1,13 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useMemo, useContext } from 'react';
 import { format } from 'date-fns';
-import { Filter, Clock, ChevronUp, ChevronDown } from 'lucide-react';
-import { apiUrl } from '../utils/basePath';
+import { Filter, Clock, LineChart, ChevronUp, ChevronDown } from 'lucide-react';
+import { GaNameWidthContext } from '../utils/gaNameWidth';
+import { useLastSeenValues } from '../hooks/useLastSeenValues';
 import { SendToGaPopover } from './SendToGaPopover';
 import type { Telegram } from '../hooks/useWebSocket';
 
 // Sortable table of group addresses with their last seen values (#269).
-// Used by the building view for a KO's linked GAs and a function's GAs.
+// Used by the building view for a KO's linked GAs and a function's GAs (#306).
 
 export interface GaTableEntry {
   address: string;
@@ -29,6 +30,8 @@ interface GaValuesTableProps {
   writeEnabled?: boolean;
   onFilterGAs: (addresses: string[]) => void;
   onLastSeen: (address: string | string[], mode: 'ga' | 'pa') => void;
+  /** Open the visualization panel plotting this GA (#307). */
+  onVisualizeGAs: (addresses: string[]) => void;
 }
 
 const gaSortValue = (address: string): number => {
@@ -93,40 +96,16 @@ const HeaderCell: React.FC<{
 };
 
 export const GaValuesTable: React.FC<GaValuesTableProps> = ({
-  entries, depth, latestTelegram, writeEnabled, onFilterGAs, onLastSeen,
+  entries, depth, latestTelegram, writeEnabled, onFilterGAs, onLastSeen, onVisualizeGAs,
 }) => {
-  const [valuesByGA, setValuesByGA] = useState<Record<string, Telegram>>({});
   const [sort, setSort] = useState<{ key: SortKey; dir: 'asc' | 'desc' } | null>(null);
+  const nameWidthCh = useContext(GaNameWidthContext);
+  const nameColumnStyle: React.CSSProperties = nameWidthCh
+    ? { width: `${nameWidthCh}ch`, maxWidth: `${nameWidthCh}ch` }
+    : { maxWidth: 300 };
 
-  const addresses = useMemo(() => [...new Set(entries.map(e => e.address))], [entries]);
-  const addressSet = useMemo(() => new Set(addresses), [addresses]);
-
-  const fetchValues = useCallback(async () => {
-    if (addresses.length === 0) return;
-    try {
-      const res = await fetch(
-        apiUrl(`/api/telegrams/last?target_address=${encodeURIComponent(addresses.join(','))}`)
-      );
-      const json = await res.json();
-      const map: Record<string, Telegram> = {};
-      for (const t of (json.telegrams ?? []) as Telegram[]) map[t.target_address] = t;
-      setValuesByGA(map);
-    } catch {
-      // network errors are non-fatal; the table just shows "never seen"
-    }
-  }, [addresses]);
-
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    void fetchValues();
-  }, [fetchValues]);
-
-  // Keep values current from the live feed without re-fetching.
-  useEffect(() => {
-    if (!latestTelegram || !addressSet.has(latestTelegram.target_address)) return;
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setValuesByGA(prev => ({ ...prev, [latestTelegram.target_address]: latestTelegram }));
-  }, [latestTelegram, addressSet]);
+  const addresses = useMemo(() => entries.map(e => e.address), [entries]);
+  const valuesByGA = useLastSeenValues(addresses, latestTelegram);
 
   const handleSort = (key: SortKey) =>
     setSort(prev => {
@@ -179,6 +158,8 @@ export const GaValuesTable: React.FC<GaValuesTableProps> = ({
                 key={entry.address}
                 style={entry.sending ? { background: 'rgba(99,102,241,0.08)' } : undefined}
                 title={entry.sending ? 'Sending group address' : undefined}
+                onMouseEnter={e => (e.currentTarget.style.background = 'var(--bg-hover)')}
+                onMouseLeave={e => (e.currentTarget.style.background = entry.sending ? 'rgba(99,102,241,0.08)' : 'transparent')}
               >
                 <td style={{ ...cellStyle, width: '1%' }}>
                   {/* The sending GA is framed rather than icon-tagged (#295). */}
@@ -199,7 +180,7 @@ export const GaValuesTable: React.FC<GaValuesTableProps> = ({
                     }}
                   >{entry.address}</span>
                 </td>
-                <td style={{ ...cellStyle, maxWidth: 300, color: 'var(--text-dim)' }} title={entry.name || undefined}>
+                <td style={{ ...cellStyle, ...nameColumnStyle, color: 'var(--text-dim)' }} title={entry.name || undefined}>
                   {entry.name || '—'}
                 </td>
                 <td style={{ ...cellStyle, width: '1%', color: 'var(--text-dim)' }} title={dptLabel || undefined}>
@@ -209,15 +190,15 @@ export const GaValuesTable: React.FC<GaValuesTableProps> = ({
                   style={{ ...cellStyle, width: '1%', color: 'var(--text-dim)', fontVariantNumeric: 'tabular-nums' }}
                   title={t ? `by ${t.source_address}${t.source_name ? ` (${t.source_name})` : ''}` : 'Never updated'}
                 >
-                  {t ? format(new Date(t.timestamp), 'yyyy-MM-dd HH:mm:ss.SS') : '—'}
+                  {t ? format(new Date(t.timestamp), 'yyyy-MM-dd HH:mm:ss.SS') : ''}
                 </td>
                 <td style={{ ...cellStyle, fontWeight: 600, color: t ? 'var(--text-main)' : 'var(--text-dim)' }}>
-                  {t ? (
+                  {t && (
                     <>
                       {t.value_formatted ?? t.value_numeric ?? '—'}
                       {t.unit && <span style={{ fontWeight: 400, color: 'var(--text-dim)' }}> {t.unit}</span>}
                     </>
-                  ) : 'never seen'}
+                  )}
                 </td>
                 <td style={{ ...cellStyle, width: '1%' }}>
                   <span style={{ display: 'inline-flex', alignItems: 'center' }}>
@@ -230,6 +211,15 @@ export const GaValuesTable: React.FC<GaValuesTableProps> = ({
                         buttonStyle={iconBtnStyle}
                       />
                     )}
+                    <button
+                      style={iconBtnStyle}
+                      title="Visualize this group address"
+                      onClick={e => { e.stopPropagation(); onVisualizeGAs([entry.address]); }}
+                      onMouseEnter={e => (e.currentTarget.style.color = 'var(--accent-primary)')}
+                      onMouseLeave={e => (e.currentTarget.style.color = 'var(--text-dim)')}
+                    >
+                      <LineChart size={11} />
+                    </button>
                     <button
                       style={iconBtnStyle}
                       title="Filter by this group address"

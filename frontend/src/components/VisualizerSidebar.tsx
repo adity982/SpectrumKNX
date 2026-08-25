@@ -1,33 +1,48 @@
 import React, { useMemo, useState } from 'react';
-import { LineChart, X, Search } from 'lucide-react';
+import { LineChart, X, Search, Filter, Clock } from 'lucide-react';
 import type { Telegram } from '../hooks/useWebSocket';
 import { OptionRow } from './FilterPanel';
+import { SendToGaPopover } from './SendToGaPopover';
 import { RAW_DPT_OPTIONS } from '../utils/rawDpt';
+import { getPref, setPref } from '../utils/prefs';
+import { rowIconBtnStyle } from '../utils/buttonStyles';
 
 interface TargetCount {
   address: string;
   name: string;
   count: number;
+  dptMain: number | null;
+  dptSub: number | null;
 }
 
 interface VisualizerSidebarProps {
   telegrams: Telegram[];
   selectedTargets: string[];
   onTargetsChange: (targets: string[]) => void;
-  onClose: () => void;
   /** Selected GAs with no project DPT that need a manual datatype to plot (#315). */
   untypedTargets?: Set<string>;
   /** Chosen datatype key per address. */
   dptOverrides?: Record<string, string>;
   /** Assign (or clear, with '') the datatype for a GA. */
   onDptOverrideChange?: (address: string, key: string) => void;
+  /** Per-target row actions (#341): write/filter/last-seen. */
+  writeEnabled?: boolean;
+  onFilterGAs?: (addresses: string[]) => void;
+  onLastSeen?: (address: string | string[], mode: 'ga' | 'pa') => void;
 }
 
 export const VisualizerSidebar: React.FC<VisualizerSidebarProps> = ({
-  telegrams, selectedTargets, onTargetsChange, onClose,
+  telegrams, selectedTargets, onTargetsChange,
   untypedTargets, dptOverrides = {}, onDptOverrideChange,
+  writeEnabled, onFilterGAs, onLastSeen,
 }) => {
-  const [search, setSearch] = useState('');
+  // Persisted so the Targets filter survives closing/reopening the panel and
+  // reloads, like the other visualization prefs (#361).
+  const [search, setSearch] = useState(() => getPref('vizTargetSearch') ?? '');
+  const changeSearch = (value: string) => {
+    setSearch(value);
+    setPref('vizTargetSearch', value);
+  };
 
   // Extract unique targets and their counts from the currently plotted dataset
   const targetCounts = useMemo(() => {
@@ -38,7 +53,9 @@ export const VisualizerSidebar: React.FC<VisualizerSidebarProps> = ({
         map.set(t.target_address, {
           address: t.target_address,
           name: t.target_name || 'Unknown Target',
-          count: 0
+          count: 0,
+          dptMain: t.dpt_main,
+          dptSub: t.dpt_sub,
         });
       }
       map.get(t.target_address)!.count++;
@@ -68,7 +85,15 @@ export const VisualizerSidebar: React.FC<VisualizerSidebarProps> = ({
         <span style={{ fontWeight: 600, fontSize: '0.875rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
           <LineChart size={16} style={{ color: 'var(--accent-primary)' }} /> Targets
         </span>
-        <button onClick={onClose} className="icon-button" title="Close Visualization" style={{ padding: '0.2rem' }}>
+        {/* Clears the checkmarks, like the filter panel's clear-all (#347). The
+            panel itself is closed with the X in the chart-area header. */}
+        <button
+          onClick={() => onTargetsChange([])}
+          disabled={selectedTargets.length === 0}
+          className="icon-button"
+          title="Clear all selected targets"
+          style={{ padding: '0.2rem', opacity: selectedTargets.length === 0 ? 0.4 : 1 }}
+        >
           <X size={14} />
         </button>
       </div>
@@ -84,7 +109,7 @@ export const VisualizerSidebar: React.FC<VisualizerSidebarProps> = ({
             type="text"
             placeholder="Search targets..."
             value={search}
-            onChange={e => setSearch(e.target.value)}
+            onChange={e => changeSearch(e.target.value)}
             style={{
               background: 'transparent', border: 'none', outline: 'none',
               color: 'var(--text-main)', fontSize: '0.8125rem', width: '100%',
@@ -111,6 +136,41 @@ export const VisualizerSidebar: React.FC<VisualizerSidebarProps> = ({
                 checked={selected}
                 count={t.count}
                 onToggle={() => toggle(t.address)}
+                actions={(writeEnabled || onFilterGAs || onLastSeen) && (
+                  <>
+                    {writeEnabled && (
+                      <SendToGaPopover
+                        address={t.address}
+                        name={t.name}
+                        dptMain={t.dptMain}
+                        dptSub={t.dptSub}
+                        buttonStyle={rowIconBtnStyle}
+                      />
+                    )}
+                    {onFilterGAs && (
+                      <button
+                        style={rowIconBtnStyle}
+                        title="Filter by this group address"
+                        onClick={() => onFilterGAs([t.address])}
+                        onMouseEnter={e => (e.currentTarget.style.color = 'var(--accent-primary)')}
+                        onMouseLeave={e => (e.currentTarget.style.color = 'var(--text-dim)')}
+                      >
+                        <Filter size={11} />
+                      </button>
+                    )}
+                    {onLastSeen && (
+                      <button
+                        style={rowIconBtnStyle}
+                        title="Show last seen values"
+                        onClick={() => onLastSeen([t.address], 'ga')}
+                        onMouseEnter={e => (e.currentTarget.style.color = 'var(--accent-primary)')}
+                        onMouseLeave={e => (e.currentTarget.style.color = 'var(--text-dim)')}
+                      >
+                        <Clock size={11} />
+                      </button>
+                    )}
+                  </>
+                )}
               />
               {needsDpt && (
                 <div style={{ padding: '0 0.25rem 0.5rem 1.75rem', marginTop: '-0.25rem' }}>

@@ -1,12 +1,27 @@
+import asyncio
 import dataclasses
+import json
+import logging
 import os
 import subprocess
 import tempfile
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 from fastapi.responses import StreamingResponse
+from knx_telegram_store import TelegramQuery
 from knx_telegram_store.formats import COMMUNICATION_LOG_FOOTER, COMMUNICATION_LOG_HEADER, format_telegram_element
 from pydantic import BaseModel, Field
 from sqlalchemy import text
@@ -14,18 +29,21 @@ from xknx.exceptions import ConversionError, CouldNotParseAddress
 from xknx.telegram.address import GroupAddress, IndividualAddress
 
 import cyclic_send
+import ha_live_bridge
 import knx_daemon  # import global config
+import pg_listen_bridge
 import telegram_export
 import telegram_import
 import update_check
-from database import READ_ONLY, engine, store
-from knx_telegram_store import TelegramQuery
+from database import READ_ONLY, STORE_MODE, engine, store
 from parsers import (
     format_dpt_name,
     format_value_nicely,
     get_simplified_type,
 )
 from ws_manager import manager
+
+logger = logging.getLogger("uvicorn.error")
 
 router = APIRouter()
 
@@ -50,6 +68,111 @@ def get_backend_version() -> str:
 async def get_version():
     """Returns the backend version from ENV or git"""
     return {"version": get_backend_version()}
+
+
+@router.get("/health")
+@router.get("/api/health")
+@router.get("/health/liveness")
+@router.get("/api/health/liveness")
+@router.get("/health/readiness")
+@router.get("/api/health/readiness")
+async def get_health(request: Request, response: Response, probe_type: str | None = None):
+    """Health check endpoint for monitoring systems and Kubernetes probes.
+
+    Checks:
+    - database: reachability and store query execution.
+    - knx_connection: active bus connection in standalone/postgres-readonly modes,
+      or live feed status in external-readonly mode.
+    - telegrams: timestamp of the last telegram processed and time elapsed.
+    """
+    path = request.url.path
+    if path.endswith("/liveness") or probe_type == "liveness":
+        check_type = "liveness"
+    elif path.endswith("/readiness") or probe_type == "readiness":
+        check_type = "readiness"
+    else:
+        check_type = "full"
+
+    # 1. Database Check & Latest DB Telegram
+    db_status = "ok"
+    db_error = None
+    latest_db_telegram_ts = None
+
+    try:
+        res = await store.query(TelegramQuery(limit=1, order_descending=True))
+        if res.telegrams:
+            t_ts = res.telegrams[0].timestamp
+            if t_ts.tzinfo is None:
+                t_ts = t_ts.replace(tzinfo=UTC)
+            latest_db_telegram_ts = t_ts
+    except Exception as e:
+        db_status = "error"
+        db_error = str(e)
+
+    # 2. KNX Connection Check
+    knx_status = "n/a"
+    knx_connected = None
+
+    if STORE_MODE in ("standalone", "postgres-readonly"):
+        knx_connected = knx_daemon.is_connected()
+        knx_status = "ok" if knx_connected else "disconnected"
+    elif STORE_MODE == "external-readonly":
+        feed_stat = ha_live_bridge.live_feed_status()
+        knx_connected = feed_stat.get("connected", False)
+        knx_status = "ok" if knx_connected else "disconnected"
+
+    # 3. Telegram Activity Tracking
+    in_mem_ts = None
+    if STORE_MODE in ("standalone", "postgres-readonly"):
+        in_mem_ts = knx_daemon.get_last_telegram_timestamp()
+    elif STORE_MODE == "external-readonly":
+        in_mem_ts = ha_live_bridge.get_last_telegram_timestamp()
+
+    if STORE_MODE == "postgres-readonly" and in_mem_ts is None:
+        in_mem_ts = pg_listen_bridge.get_last_telegram_timestamp()
+
+    last_received_at = None
+    if in_mem_ts and latest_db_telegram_ts:
+        last_received_at = max(in_mem_ts, latest_db_telegram_ts)
+    else:
+        last_received_at = in_mem_ts or latest_db_telegram_ts
+
+    now = datetime.now(UTC)
+    seconds_since_last = None
+    if last_received_at:
+        if last_received_at.tzinfo is None:
+            last_received_at = last_received_at.replace(tzinfo=UTC)
+        seconds_since_last = round((now - last_received_at).total_seconds(), 2)
+
+    is_live = db_status == "ok"
+    is_ready = is_live and (knx_status in ("ok", "n/a"))
+
+    overall_ok = is_live if check_type == "liveness" else is_ready
+
+    if not overall_ok:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+
+    return {
+        "status": "ok" if overall_ok else "unhealthy",
+        "timestamp": now.isoformat(),
+        "version": get_backend_version(),
+        "store_mode": STORE_MODE,
+        "checks": {
+            "database": {
+                "status": db_status,
+                "error": db_error,
+            },
+            "knx_connection": {
+                "status": knx_status,
+                "connected": knx_connected,
+            },
+            "telegrams": {
+                "status": "ok" if last_received_at is not None else "no_telegrams",
+                "last_received_at": last_received_at.isoformat() if last_received_at else None,
+                "seconds_since_last_telegram": seconds_since_last,
+            },
+        },
+    }
 
 
 @router.get("/api/update")
@@ -260,8 +383,8 @@ async def get_filter_options():
 
 def _aggregate_statistics(
     rows: list,
-    ga_name_map: dict[str, str],
-    pa_name_map: dict[str, str],
+    ga_name_map: dict[str, str | None],
+    pa_name_map: dict[str, str | None],
 ) -> dict:
     """Aggregate (source, destination, count) rows into GA/PA totals.
 
@@ -280,9 +403,9 @@ def _aggregate_statistics(
         ga_sources.setdefault(destination, {})[source] = ga_sources.setdefault(destination, {}).get(source, 0) + cnt
         pa_dests.setdefault(source, {})[destination] = pa_dests.setdefault(source, {}).get(destination, 0) + cnt
 
-    def _children(counts: dict[str, int], name_map: dict[str, str]) -> list:
+    def _children(counts: dict[str, int], name_map: dict[str, str | None]) -> list:
         return sorted(
-            [{"address": addr, "name": name_map.get(addr, ""), "count": cnt} for addr, cnt in counts.items()],
+            [{"address": addr, "name": name_map.get(addr) or "", "count": cnt} for addr, cnt in counts.items()],
             key=lambda x: x["count"],
             reverse=True,
         )
@@ -291,7 +414,7 @@ def _aggregate_statistics(
         [
             {
                 "address": addr,
-                "name": ga_name_map.get(addr, ""),
+                "name": ga_name_map.get(addr) or "",
                 "count": cnt,
                 "children": _children(ga_sources.get(addr, {}), pa_name_map),
             }
@@ -304,7 +427,7 @@ def _aggregate_statistics(
         [
             {
                 "address": addr,
-                "name": pa_name_map.get(addr, ""),
+                "name": pa_name_map.get(addr) or "",
                 "count": cnt,
                 "children": _children(pa_dests.get(addr, {}), ga_name_map),
             }
@@ -332,17 +455,11 @@ async def get_statistics():
         result = await conn.execute(sql)
         rows = result.fetchall()
 
-    ga_name_map: dict[str, str] = {}
-    pa_name_map: dict[str, str] = {}
+    ga_name_map: dict[str, str | None] = {}
+    pa_name_map: dict[str, str | None] = {}
     if knx_daemon.global_knx_project:
-        for addr, data in knx_daemon.global_knx_project.get("group_addresses", {}).items():
-            ga_name_map[addr] = data.get("name", "")
-        for addr, data in knx_daemon.global_knx_project.get("devices", {}).items():
-            try:
-                ia_str = str(IndividualAddress(addr))
-            except Exception:
-                ia_str = str(addr)
-            pa_name_map[ia_str] = data.get("name", "")
+        ga_name_map = knx_daemon.project_name_map.get("ga", {})
+        pa_name_map = knx_daemon.project_name_map.get("ia", {})
 
     return _aggregate_statistics(rows, ga_name_map, pa_name_map)
 
@@ -384,8 +501,13 @@ class KnxReadRequest(BaseModel):
 
 
 def _require_bus_write() -> None:
-    """Guard for the send/read endpoints: standalone mode, connected, and allowed."""
-    if READ_ONLY or not knx_daemon.ALLOW_WRITE:
+    """Guard for the send/read endpoints: a live bus connection and writing not forbidden.
+
+    external-readonly never starts a daemon, so is_connected() is always
+    False there without needing a separate check; postgres-readonly's daemon
+    can be connected and write, even though its telegram store is read-only.
+    """
+    if not knx_daemon.ALLOW_WRITE:
         raise HTTPException(status_code=403, detail="Sending to the KNX bus is disabled")
     if not knx_daemon.is_connected():
         raise HTTPException(status_code=409, detail="Not connected to the KNX bus")
@@ -521,9 +643,27 @@ async def get_project():
 
 def _build_ko(co: dict, gas: dict) -> dict:
     """Serialize a communication object (KO) with its connected group addresses."""
-    group_addresses = [
-        {"address": ga, "name": gas.get(ga, {}).get("name", "")} for ga in co.get("group_address_links") or []
-    ]
+    group_addresses = []
+    for ga_addr in co.get("group_address_links") or []:
+        ga_master = gas.get(ga_addr) or {}
+        # Each GA's own DPT, resolved from the project — may differ from the KO's
+        # own DPT declaration even within the same main category (#307).
+        ga_dpt = ga_master.get("dpt")
+        group_addresses.append(
+            {
+                "address": ga_addr,
+                "name": ga_master.get("name", ""),
+                "dpt": (
+                    {
+                        "main": ga_dpt.get("main"),
+                        "sub": ga_dpt.get("sub"),
+                        "name": format_dpt_name(ga_dpt.get("main"), ga_dpt.get("sub"))[0],
+                    }
+                    if ga_dpt
+                    else None
+                ),
+            }
+        )
     # Resolve each DPT's descriptive name (e.g. "5.001 - Percent") so the building
     # view can show it like the group monitor does, not just the raw numbers.
     dpts = [
@@ -589,7 +729,9 @@ def _build_device(addr: str, device: dict, cos: dict, gas: dict) -> dict:
 
 def _build_space(space: dict, devices: dict, cos: dict, gas: dict, functions_dict: dict) -> dict:
     """Recursively serialize a building space with nested spaces, devices, and functions."""
-    child_spaces = [_build_space(sub, devices, cos, gas, functions_dict) for sub in (space.get("spaces") or {}).values()]
+    child_spaces = [
+        _build_space(sub, devices, cos, gas, functions_dict) for sub in (space.get("spaces") or {}).values()
+    ]
     device_nodes = [
         _build_device(dev_addr, devices[dev_addr], cos, gas)
         for dev_addr in space.get("devices") or []
@@ -606,24 +748,34 @@ def _build_space(space: dict, devices: dict, cos: dict, gas: dict, functions_dic
                 dpt = ga_master.get("dpt")
                 # The function ref's own name is empty and its "role" is an opaque
                 # UUID; resolve the real GA name + DPT from the project (#295).
-                group_addresses.append({
-                    "address": ga_addr,
-                    "name": ga_master.get("name") or ga_ref.get("name", ""),
-                    "dpts": (
-                        [{
-                            "main": dpt.get("main"),
-                            "sub": dpt.get("sub"),
-                            "name": format_dpt_name(dpt.get("main"), dpt.get("sub"))[0],
-                        }]
-                        if dpt else []
-                    ),
-                })
-            space_functions.append({
-                "id": func_id,
-                "name": func.get("name", ""),
-                "type": func.get("function_type", ""),
-                "group_addresses": group_addresses
-            })
+                group_addresses.append(
+                    {
+                        "address": ga_addr,
+                        "name": ga_master.get("name") or ga_ref.get("name", ""),
+                        "dpts": (
+                            [
+                                {
+                                    "main": dpt.get("main"),
+                                    "sub": dpt.get("sub"),
+                                    "name": format_dpt_name(dpt.get("main"), dpt.get("sub"))[0],
+                                }
+                            ]
+                            if dpt
+                            else []
+                        ),
+                    }
+                )
+            space_functions.append(
+                {
+                    "id": func_id,
+                    "name": func.get("name", ""),
+                    "type": func.get("function_type", ""),
+                    # ETS function-type name (e.g. FT-1 -> "Licht schalten"), resolved by
+                    # xknxproject from ETS master data (#307).
+                    "type_name": func.get("usage_text", ""),
+                    "group_addresses": group_addresses,
+                }
+            )
 
     return {
         "kind": "space",
@@ -693,6 +845,17 @@ def _project_upload_path() -> tuple[str, str | None]:
     return proj_file, pwd_file
 
 
+def _project_meta_path() -> str:
+    """Sidecar holding the original upload filename and import time (#425).
+
+    Uploads are all written to the same fixed path, so the name the user
+    actually chose — which many people use for versioning — is otherwise lost.
+    Sits next to the project file like the password sidecar.
+    """
+    proj_file, _ = _project_upload_path()
+    return os.path.splitext(proj_file)[0] + "_meta.json"
+
+
 def _project_upload_writable() -> bool:
     """Returns True if the upload destination is writable."""
     proj_file, _ = _project_upload_path()
@@ -725,28 +888,51 @@ async def upload_project(file: UploadFile = File(...), password: str = Form(""))
 
     proj_file, pwd_file = _project_upload_path()
 
-    os.makedirs(os.path.dirname(proj_file), exist_ok=True)
-
     content = await file.read()
 
-    try:
+    def save_project_files():
+        os.makedirs(os.path.dirname(proj_file), exist_ok=True)
         with open(proj_file, "wb") as f:
             f.write(content)
         if pwd_file:
             with open(pwd_file, "w", encoding="utf-8") as f:
                 f.write(password)
+
+    try:
+        await asyncio.to_thread(save_project_files)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=f"Cannot write project file: {e}") from e
 
     # Trigger reload
     success = await knx_daemon._load_project_data()
 
+    meta_file = _project_meta_path()
     if not success:
         if os.path.exists(proj_file) and not os.getenv("KNX_PROJECT_PATH"):
             os.remove(proj_file)
         if pwd_file and os.path.exists(pwd_file):
             os.remove(pwd_file)
+        # A stale sidecar would otherwise describe a project that is no longer there.
+        if os.path.exists(meta_file):
+            os.remove(meta_file)
         raise HTTPException(status_code=400, detail="Failed to load project. Incorrect password or invalid file.")
+
+    # Record what the user uploaded, now that we know it parses (#425). Never
+    # fatal: the project is loaded either way, this only feeds the settings UI.
+    def save_meta():
+        with open(meta_file, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "original_filename": file.filename,
+                    "imported_at": datetime.now(UTC).isoformat(),
+                },
+                f,
+            )
+
+    try:
+        await asyncio.to_thread(save_meta)
+    except OSError as e:
+        logger.warning("Could not write project metadata sidecar: %s", e)
 
     return {"status": "ok", "message": "Project loaded successfully"}
 
@@ -790,16 +976,21 @@ async def upload_knxkeys(file: UploadFile = File(...), password: str = Form(""))
         raise HTTPException(status_code=400, detail="File must be a .knxkeys file")
 
     default_dir = "/project"
-    os.makedirs(default_dir, exist_ok=True)
-
     content = await file.read()
 
-    with open(knx_daemon.DEFAULT_KNXKEYS_FILE, "wb") as f:
-        f.write(content)
+    def save_knxkeys_files():
+        os.makedirs(default_dir, exist_ok=True)
+        with open(knx_daemon.DEFAULT_KNXKEYS_FILE, "wb") as f:
+            f.write(content)
 
-    if password:
-        with open(knx_daemon.DEFAULT_KNXKEYS_PASSWORD_FILE, "w", encoding="utf-8") as f:
-            f.write(password)
+        if password:
+            with open(knx_daemon.DEFAULT_KNXKEYS_PASSWORD_FILE, "w", encoding="utf-8") as f:
+                f.write(password)
+
+    try:
+        await asyncio.to_thread(save_knxkeys_files)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=f"Cannot write KNX keys file: {e}") from e
 
     # Trigger reconnection with new credentials
     await knx_daemon._reconnect_knx()
@@ -902,8 +1093,10 @@ async def export_telegrams(
 @router.websocket("/ws/telegrams")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
-    if not READ_ONLY:
-        # Initial state so (re)connecting clients don't have to wait for a change
+    if STORE_MODE != "external-readonly":
+        # A daemon (and thus a bus connection state) exists in both standalone
+        # and postgres-readonly mode. Initial state so (re)connecting clients
+        # don't have to wait for a change.
         connected = knx_daemon.is_connected()
         await websocket.send_json(
             {

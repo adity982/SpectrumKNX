@@ -24,7 +24,8 @@ const sampleWorkspace = (): WorkspaceState => ({
     dpts: ['1.001', '9'],
     deltaBeforeMs: 500,
     deltaAfterMs: 1000,
-    sourceTargetRelation: 'OR',
+    // Only AND round-trips now — `rel_st` is no longer written (#275).
+    sourceTargetRelation: 'AND',
   },
   plot: ['0/1/2'],
   lastSeenAddresses: ['0/1/2'],
@@ -111,6 +112,18 @@ describe('monitor URL encoding', () => {
       ...DEFAULT_WORKSPACE,
       filters: { ...DEFAULT_FILTERS, dpts: ['1.001'] },
     });
+  });
+
+  it('round-trips a disabled Time-Delta-Context, keeping the stored values (#318)', () => {
+    const ws: WorkspaceState = {
+      ...DEFAULT_WORKSPACE,
+      filters: { ...DEFAULT_FILTERS, deltaBeforeMs: 500, deltaContextEnabled: false },
+    };
+    const search = buildMonitorSearch(ws);
+    expect(search).toContain('delta_off=1');
+    const parsed = parseMonitorSearch('?' + search);
+    expect(parsed!.filters.deltaContextEnabled).toBe(false);
+    expect(parsed!.filters.deltaBeforeMs).toBe(500);
   });
 });
 

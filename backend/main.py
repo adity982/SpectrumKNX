@@ -7,16 +7,17 @@ from dotenv import load_dotenv
 # Load environment variables from .env file if it exists
 load_dotenv()
 
-from fastapi import FastAPI  # noqa: E402
+from fastapi import FastAPI, Request  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
-from fastapi.responses import FileResponse  # noqa: E402
+from fastapi.responses import FileResponse, RedirectResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 import cyclic_send  # noqa: E402
 import mcp_server  # noqa: E402
+import pg_listen_bridge  # noqa: E402
 from api import get_backend_version  # noqa: E402
 from api import router as api_router  # noqa: E402
-from database import READ_ONLY, engine  # noqa: E402
+from database import STORE_MODE, engine  # noqa: E402
 from ha_live_bridge import companion_shutdown, companion_startup  # noqa: E402
 from knx_daemon import knx_shutdown, knx_startup  # noqa: E402
 from security import is_safe_path  # noqa: E402
@@ -29,10 +30,16 @@ async def lifespan(app: FastAPI):
     # Startup
     version = get_backend_version()
     logger.info(f"Starting Spectrum KNX Backend (Version: {version})")
-    if READ_ONLY:
-        # Companion mode: no KNX daemon — another process (Home Assistant)
-        # owns the bus connection and writes the store we read.
+    if STORE_MODE == "external-readonly":
+        # Sqlite companion mode: no KNX daemon — another process (Home
+        # Assistant) owns the bus connection and writes the store we read.
         await companion_startup()
+    elif STORE_MODE == "postgres-readonly":
+        # Shared-Postgres companion mode: our own daemon still connects to
+        # the bus (for writes), but never touches the store — the writer
+        # already does. Live updates come from LISTEN/NOTIFY instead.
+        await knx_startup()
+        await pg_listen_bridge.postgres_listen_startup()
     else:
         await knx_startup()
 
@@ -43,8 +50,12 @@ async def lifespan(app: FastAPI):
         yield
 
     # Shutdown
-    if READ_ONLY:
+    if STORE_MODE == "external-readonly":
         await companion_shutdown()
+    elif STORE_MODE == "postgres-readonly":
+        await pg_listen_bridge.postgres_listen_shutdown()
+        await cyclic_send.shutdown()
+        await knx_shutdown()
     else:
         await cyclic_send.shutdown()
         await knx_shutdown()
@@ -53,9 +64,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Spectrum KNX API", lifespan=lifespan)
 
+# CORS configuration: default to "*" to preserve existing behavior across deployments
+cors_origins_raw = os.getenv("CORS_ORIGINS", "*")
+cors_origins = [origin.strip() for origin in cors_origins_raw.split(",") if origin.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -66,6 +81,24 @@ app.include_router(api_router)
 # Mount the MCP Streamable HTTP endpoint before the SPA catch-all so /mcp is not
 # swallowed by static routing (#332). Disabled when MCP_MODE=off.
 if mcp_server.mcp_enabled():
+
+    @app.api_route("/mcp", methods=["GET", "POST", "DELETE", "OPTIONS", "HEAD"], include_in_schema=False)
+    async def mcp_root_redirect(request: Request):
+        """Redirect the bare /mcp to /mcp/ (#426).
+
+        Starlette compiles a Mount path into ``^/mcp(?P<path>/.*)$``, so the
+        mount below never matches the bare "/mcp" — without this the request
+        falls through to the SPA catch-all and an MCP client's POST gets a
+        confusing 405 (the catch-all is GET-only) while a browser gets
+        index.html. Router-level redirect_slashes can't help because the
+        catch-all always matches. 307 preserves the method and body, so the
+        client's initialize POST survives the redirect.
+        """
+        target = request.url.path + "/"
+        if request.url.query:
+            target = f"{target}?{request.url.query}"
+        return RedirectResponse(target, status_code=307)
+
     app.mount("/mcp", mcp_server.get_asgi_app())
     logger.info(f"MCP endpoint mounted at /mcp (mode: {mcp_server.MCP_MODE})")
 

@@ -1,6 +1,8 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { TelegramTable, type SortConfig, type SortKey } from './TelegramTable';
-import { readSortConfigPref, writeSortConfigPref } from '../utils/sortConfig';
+import { readSortConfigPref, writeSortConfigPref, toggleSortLevel, sortTelegrams } from '../utils/sortConfig';
+import { expandWithDeltaContext } from '../utils/deltaContextExpansion';
+import { anchorKey } from '../utils/anchorKey';
 import type { Telegram } from '../hooks/useWebSocket';
 import { History, Download, AlertTriangle, Trash2, SlidersHorizontal, LineChart, RefreshCw } from 'lucide-react';
 import { HistoryLoader } from './HistoryLoader';
@@ -9,11 +11,15 @@ import { FilterPanel } from './FilterPanel';
 import { loadHistoryTelegrams, type LoadedRange } from '../utils/historyLoad';
 import { buildViewUrl, type VizViewState } from '../utils/viewUrl';
 import {
+  effectiveDeltaContext,
   hasActiveFilters,
   matchesTelegram,
   type ActiveFilters,
   type FilterOptions,
 } from '../types/filters';
+
+// Stable identity so passing "no flags" doesn't churn memo deps (#319).
+const EMPTY_FLAG_SET: ReadonlySet<string> = new Set();
 
 export type LoaderTimeRange = {
   relValue: number;
@@ -44,6 +50,8 @@ export const HistorySearch: React.FC<HistorySearchProps> = ({
   const [isLoaderOpen, setIsLoaderOpen] = useState(false);
   const [metadata, setMetadata] = useState<{ total_count: number; limit_reached: boolean } | null>(null);
   const [sortConfig, setSortConfig] = useState<SortConfig>(readSortConfigPref);
+  // Per-message Time-Delta-Context flags (#319) — local to this view, like marks.
+  const [flaggedKeys, setFlaggedKeys] = useState<string[]>([]);
   const [isFilterOpen, setIsFilterOpen] = useState(false);
   const [isVisualizerOpen, setIsVisualizerOpen] = useState(false);
 
@@ -75,12 +83,9 @@ export const HistorySearch: React.FC<HistorySearchProps> = ({
       .catch(err => console.error('Failed to load shared view:', err));
   }, [initialView, loadLimit]);
 
-  const handleSort = (key: SortKey) => {
+  const handleSort = (key: SortKey, opts?: { additive?: boolean }) => {
     setSortConfig(prev => {
-      const next: SortConfig = {
-        key,
-        direction: prev.key === key && prev.direction === 'desc' ? 'asc' : 'desc',
-      };
+      const next = toggleSortLevel(prev, key, !!opts?.additive);
       writeSortConfigPref(next);
       return next;
     });
@@ -104,31 +109,21 @@ export const HistorySearch: React.FC<HistorySearchProps> = ({
     setIsFilterOpen(false);
   };
 
-  const sortedTelegrams = useMemo(() => {
-    const items = [...telegrams];
-    items.sort((a, b) => {
-      const aVal = a[sortConfig.key];
-      const bVal = b[sortConfig.key];
-      if (aVal === bVal) return 0;
-      if (aVal == null) return 1;
-      if (bVal == null) return -1;
-      if (sortConfig.key === 'timestamp') {
-        const timeA = new Date(aVal as string).getTime();
-        const timeB = new Date(bVal as string).getTime();
-        return sortConfig.direction === 'asc'
-          ? timeA - timeB
-          : timeB - timeA;
-      }
+  // Time-Delta-Context window, edited from the telegram list's DELTA TIME
+  // quick-filter cell rather than the filter pane (#309, #371).
+  const handleDeltaContextChange = (deltaBeforeMs: number, deltaAfterMs: number) => {
+    onFiltersChange({ ...activeFilters, deltaBeforeMs, deltaAfterMs });
+  };
 
-      const valA = (aVal as string | number);
-      const valB = (bVal as string | number);
+  // Toggles the window on/off without losing the entered values (#318).
+  const handleDeltaContextEnabledChange = (deltaContextEnabled: boolean) => {
+    onFiltersChange({ ...activeFilters, deltaContextEnabled });
+  };
 
-      return sortConfig.direction === 'asc'
-        ? valA < valB ? -1 : 1
-        : valA < valB ? 1 : -1;
-    });
-    return items;
-  }, [telegrams, sortConfig]);
+  const sortedTelegrams = useMemo(
+    () => sortTelegrams(telegrams, sortConfig),
+    [telegrams, sortConfig]
+  );
 
   const handleLoad = (loaded: Telegram[], meta?: { total_count: number; limit_reached: boolean }, range?: LoadedRange) => {
     setTelegrams(prev => {
@@ -150,11 +145,19 @@ export const HistorySearch: React.FC<HistorySearchProps> = ({
   };
 
   // In-memory filter pass — mirrors live view filtering so changing filters
-  // immediately applies to already-loaded data without a re-fetch.
-  const filteredSortedTelegrams = useMemo(() => {
-    if (!hasActiveFilters(activeFilters)) return sortedTelegrams;
-    return sortedTelegrams.filter(t => matchesTelegram(t, activeFilters));
-  }, [sortedTelegrams, activeFilters]);
+  // immediately applies to already-loaded data without a re-fetch. Also
+  // applies the Time-Delta-Context window client-side (#309/#319), since
+  // per-message flags are set after the historical load already happened.
+  const deltaExpandedHistory = useMemo(() => {
+    const noFilter = !hasActiveFilters(activeFilters);
+    const matches = sortedTelegrams.map(t => noFilter || matchesTelegram(t, activeFilters));
+    const { before, after } = effectiveDeltaContext(activeFilters);
+    const flags = activeFilters.deltaContextEnabled ? new Set(flaggedKeys) : EMPTY_FLAG_SET;
+    return expandWithDeltaContext(sortedTelegrams, matches, anchorKey, flags, before, after);
+  }, [sortedTelegrams, activeFilters, flaggedKeys]);
+  const filteredSortedTelegrams = deltaExpandedHistory.items;
+  // Keys of rows shown only as unfiltered context around a match/flag (#343).
+  const contextTelegramKeys = deltaExpandedHistory.contextKeys;
 
   // True when current filters are less restrictive than what was used to fetch,
   // meaning some telegrams may be missing from the loaded set.
@@ -345,6 +348,11 @@ export const HistorySearch: React.FC<HistorySearchProps> = ({
               activeFilters={activeFilters}
               onQuickFilter={handleQuickFilter}
               onQuickVisualize={handleQuickVisualize}
+              onDeltaContextChange={handleDeltaContextChange}
+              onDeltaContextEnabledChange={handleDeltaContextEnabledChange}
+              flaggedKeys={flaggedKeys}
+              onFlaggedKeysChange={setFlaggedKeys}
+              contextKeys={contextTelegramKeys}
             />
           )}
         </div>

@@ -15,8 +15,7 @@ dependencies = [
     "asyncpg",
     "fastapi",
     "httpx",
-    # Git pin for the unreleased MCP tools; revert to ">=0.11.0" once on PyPI.
-    "knx-telegram-store @ git+https://github.com/XKNX/knx-telegram-store.git@33aebf42baac37102ee8e8f9801629cf6f8cd4ff",
+    "knx-telegram-store>=0.12.0",
     "mcp",
     "pydantic",
     "python-dotenv",
@@ -24,8 +23,8 @@ dependencies = [
     "SQLAlchemy",
     "uvicorn",
     "websockets",
-    "xknx",
-    "xknxproject",
+    "xknx>=3.18.0",
+    "xknxproject>=3.10.0",
 ]
 
 [dependency-groups]

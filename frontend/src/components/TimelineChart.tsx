@@ -12,15 +12,23 @@ interface TimelineChartProps {
   maxTime: number | null;
   /** Draw a tick at each telegram timestamp so cyclic repeats are visible (#195). */
   showDots: boolean;
+  /** When true (no active zoom), let the chart re-fit to new data so a telegram
+   * that extends the range stays visible instead of falling off a frozen scale
+   * (#340). When zoomed, stays false to preserve the app-controlled range (#281). */
+  autoFollow?: boolean;
   onZoomRangeChange?: (value: [number, number] | null) => void;
+  /** Click (not drag-select) on the chart: navigate to the telegram list around
+   * this timestamp (#308). Omitted from the deps key since it's stable from callers. */
+  onTimeClick?: (ms: number) => void;
 }
 
 const syncCursor = uPlot.sync('knx-time-axis');
 
-export const TimelineChart: React.FC<TimelineChartProps> = ({ bucket, minTime, maxTime, showDots, onZoomRangeChange }) => {
+export const TimelineChart: React.FC<TimelineChartProps> = ({ bucket, minTime, maxTime, showDots, autoFollow = false, onZoomRangeChange, onTimeClick }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(800);
   const themeTick = useThemeTick();
+  const valueRefs = useRef<(HTMLDivElement | null)[]>([]);
 
   // Per-series real-telegram flags, refreshed every render and read from the
   // (stable, memoized) draw plugin so dots stay correct on live updates (#195/#207).
@@ -29,6 +37,11 @@ export const TimelineChart: React.FC<TimelineChartProps> = ({ bucket, minTime, m
   const realRef = useRef<boolean[][]>([]);
   // eslint-disable-next-line react-hooks/refs
   realRef.current = bucket.series.map(s => s.real);
+  // Same "ref read inside a stable plugin/hook" pattern as realRef above, so a
+  // new onTimeClick identity each render doesn't force the chart to rebuild.
+  const onTimeClickRef = useRef(onTimeClick);
+  // eslint-disable-next-line react-hooks/refs
+  onTimeClickRef.current = onTimeClick;
 
   useLayoutEffect(() => {
     if (!containerRef.current) return;
@@ -47,9 +60,7 @@ export const TimelineChart: React.FC<TimelineChartProps> = ({ bucket, minTime, m
 
   // Show a date alongside times once the visible range crosses midnight (#281).
   const multiDay = minTime != null && maxTime != null && spansMultipleDays(minTime, maxTime);
-  // Series labels are drawn in a fixed gutter on the right (see padding below);
-  // keep the start/end caption aligned to the actual plot area (#314).
-  const LABEL_GUTTER = 180;
+  const LEFT_GUTTER = 150;
 
   const rowHeight = 40;
   const rowGap = 4;
@@ -67,7 +78,6 @@ export const TimelineChart: React.FC<TimelineChartProps> = ({ bucket, minTime, m
     const style = getComputedStyle(document.documentElement);
     const gridStroke = style.getPropertyValue('--border-subtle').trim();
     const axisStroke = style.getPropertyValue('--text-dim').trim();
-    const accentPrimary = style.getPropertyValue('--accent-primary').trim();
 
     const timelinePlugin = () => ({
       hooks: {
@@ -138,16 +148,6 @@ export const TimelineChart: React.FC<TimelineChartProps> = ({ bucket, minTime, m
           }
 
           ctx.restore();
-
-          // Series labels (structural: names come from the closure, count from data).
-          for (let sIdx = 0; sIdx < seriesCount; sIdx++) {
-            const yTop = top + sIdx * (rowHeight + rowGap) + rowGap;
-            ctx.fillStyle = accentPrimary;
-            ctx.font = '600 12px sans-serif';
-            ctx.textAlign = 'left';
-            ctx.textBaseline = 'middle';
-            ctx.fillText(series[sIdx]?.name ?? '', left + width + 15, yTop + rowHeight / 2);
-          }
         }]
       }
     });
@@ -155,12 +155,25 @@ export const TimelineChart: React.FC<TimelineChartProps> = ({ bucket, minTime, m
     return {
       width,
       height: chartHeight,
-      padding: [0, LABEL_GUTTER, 0, 0],
+      padding: [10, 16, 30, 0],
       cursor: {
         sync: { key: syncCursor.key },
         drag: { x: true, y: false, setScale: false }
       },
       hooks: {
+        setCursor: [
+          (u) => {
+            const idx = u.cursor.idx;
+            const isOutside = u.cursor.left == null || u.cursor.left < 0;
+            series.forEach((s, sIdx) => {
+              const el = valueRefs.current[sIdx];
+              if (!el) return;
+              const val = isOutside || idx == null ? s.data[s.data.length - 1] : s.data[idx];
+              el.textContent = val === 1 ? 'On' : val === 0 ? 'Off' : '-';
+              el.style.color = val === 1 ? '#22c55e' : val === 0 ? '#ef4444' : 'var(--text-dim)';
+            });
+          }
+        ],
         setSelect: [
           (u) => {
             if (u.select.width > 0) {
@@ -172,7 +185,23 @@ export const TimelineChart: React.FC<TimelineChartProps> = ({ bucket, minTime, m
         ],
         ready: [
           (u) => {
+            // Click (not drag-select) navigates to the telegram list around this
+            // time (#308); a dblclick still resets the zoom. The navigation is
+            // delayed past the dblclick window so the first click of a dblclick
+            // doesn't fire it before the reset cancels it.
+            let clickTimer: ReturnType<typeof setTimeout> | null = null;
+            let downX: number | null = null;
+            u.over.addEventListener('mousedown', (e) => { downX = e.clientX; });
+            u.over.addEventListener('mouseup', (e) => {
+              const startX = downX;
+              downX = null;
+              if (startX === null || Math.abs(e.clientX - startX) >= 5) return;
+              const rect = u.over.getBoundingClientRect();
+              const ms = u.posToVal(e.clientX - rect.left, 'x') * 1000;
+              clickTimer = setTimeout(() => onTimeClickRef.current?.(ms), 250);
+            });
             u.over.addEventListener('dblclick', () => {
+              if (clickTimer) { clearTimeout(clickTimer); clickTimer = null; }
               onZoomRangeChange?.(null);
             });
           }
@@ -200,7 +229,7 @@ export const TimelineChart: React.FC<TimelineChartProps> = ({ bucket, minTime, m
           show: true,
           stroke: axisStroke,
           grid: { stroke: gridStroke },
-          size: 1,
+          size: LEFT_GUTTER,
           values: () => []
         }
       ],
@@ -217,20 +246,75 @@ export const TimelineChart: React.FC<TimelineChartProps> = ({ bucket, minTime, m
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [structureKey]);
 
+  const plotTop = 10;
   return (
     <div style={{ marginBottom: '2rem', background: 'var(--bg-inset)', padding: '1rem', borderRadius: '8px', border: '1px solid var(--border-color)', overflow: 'visible' }}>
       <h4 style={{ margin: '0 0 1rem', fontSize: '0.9rem', color: 'var(--text-main)' }}>
         Binary States Timeline
       </h4>
-      <div ref={containerRef} style={{ width: '100%', overflow: 'visible' }}>
-         {/* resetScales=false: keep the app-controlled zoom on live updates so a
-             new telegram doesn't snap the x-axis back to the full range (#281). */}
-         <UplotReact options={options} data={data} resetScales={false} />
+      <div style={{ position: 'relative', width: '100%' }}>
+        {/* HTML Legend Overlay on the left */}
+        <div style={{
+          position: 'absolute',
+          left: '8px',
+          top: `${plotTop + rowGap}px`,
+          width: `${LEFT_GUTTER - 16}px`,
+          height: `${chartHeight - plotTop - 30}px`,
+          display: 'flex',
+          flexDirection: 'column',
+          pointerEvents: 'none',
+          zIndex: 10,
+        }}>
+          {series.map((s, sIdx) => {
+            const lastVal = s.data[s.data.length - 1];
+            return (
+              <div
+                key={s.address}
+                style={{
+                  height: `${rowHeight}px`,
+                  marginBottom: `${rowGap}px`,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  justifyContent: 'center',
+                  fontSize: '0.75rem',
+                  lineHeight: '1.2',
+                }}
+              >
+                <div style={{
+                  fontWeight: 600,
+                  color: 'var(--text-main)',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }} title={s.name}>
+                  {s.name}
+                </div>
+                <div
+                  ref={el => { valueRefs.current[sIdx] = el; }}
+                  style={{
+                    fontSize: '0.7rem',
+                    fontWeight: 700,
+                    color: lastVal === 1 ? '#22c55e' : lastVal === 0 ? '#ef4444' : 'var(--text-dim)',
+                    marginTop: '2px',
+                  }}
+                >
+                  {lastVal === 1 ? 'On' : lastVal === 0 ? 'Off' : '-'}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div ref={containerRef} style={{ width: '100%', overflow: 'visible' }}>
+           {/* Re-fit to new data only while not zoomed (#340): keeps a new telegram
+               visible instead of dropping off a frozen scale. When the user has
+               zoomed, autoFollow is false so the range is preserved (#281). */}
+           <UplotReact options={options} data={data} resetScales={autoFollow} />
+        </div>
       </div>
-      {/* Always spell out the visible window's start and end (#314). The right
-          gutter holds the series labels, so pad the caption to match the plot. */}
+      {/* Always spell out the visible window's start and end (#314). Pad the
+          caption to match the plot area boundaries. */}
       {minTime != null && maxTime != null && (
-        <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '0.35rem', paddingRight: LABEL_GUTTER, fontSize: '0.7rem', color: 'var(--text-dim)', fontVariantNumeric: 'tabular-nums' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '0.35rem', paddingLeft: `${LEFT_GUTTER}px`, paddingRight: '16px', fontSize: '0.7rem', color: 'var(--text-dim)', fontVariantNumeric: 'tabular-nums' }}>
           <span>{formatFullTime(minTime, multiDay)}</span>
           <span>{formatFullTime(maxTime, multiDay)}</span>
         </div>
