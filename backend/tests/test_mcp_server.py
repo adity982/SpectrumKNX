@@ -213,53 +213,6 @@ async def test_lists_read_only_tools(server):
     } <= names
 
 
-@pytest.mark.asyncio
-async def test_lists_project_resources_and_prompts(server):
-    resource_uris = {str(resource.uri) for resource in await server.list_resources()}
-    assert {
-        "knx://project",
-        "knx://project/group-addresses",
-        "knx://project/devices",
-        "knx://project/topology",
-        "knx://project/locations",
-    } <= resource_uris
-
-    prompt_names = {prompt.name for prompt in await server.list_prompts()}
-    assert {"analyze_bus_traffic", "find_group_addresses_without_dpts"} <= prompt_names
-
-
-@pytest.mark.asyncio
-async def test_project_resources_expose_loaded_project(server, monkeypatch):
-    monkeypatch.setattr(
-        mcp_server.knx_daemon,
-        "global_knx_project",
-        {
-            "group_addresses": {"1/2/3": {"name": "Living temperature", "dpt": "9.001"}},
-            "devices": {"1.1.5": {"name": "Room controller"}},
-            "topology": {"1": {"name": "Main area"}},
-            "locations": {"ground-floor": {"name": "Ground floor"}},
-            "functions": {"climate": {"name": "Climate"}},
-        },
-    )
-
-    contents = await server.read_resource("knx://project")
-    payload = json.loads(contents[0].content)
-    assert payload["status"] == "ok"
-    assert payload["group_addresses"]["1/2/3"]["dpt"] == "9.001"
-    assert payload["devices"]["1.1.5"]["name"] == "Room controller"
-
-    group_addresses = await server.read_resource("knx://project/group-addresses")
-    assert json.loads(group_addresses[0].content) == {
-        "status": "ok",
-        "group_addresses": {"1/2/3": {"name": "Living temperature", "dpt": "9.001"}},
-    }
-
-
-@pytest.mark.asyncio
-async def test_project_resource_reports_when_no_project_is_loaded(server, monkeypatch):
-    monkeypatch.setattr(mcp_server.knx_daemon, "global_knx_project", None)
-    contents = await server.read_resource("knx://project/locations")
-    assert json.loads(contents[0].content) == {"status": "no_project_loaded", "locations": {}}
 # ── Project resources + canned prompts (#335) ────────────────────────────────
 
 
@@ -296,15 +249,6 @@ async def test_project_resources_report_when_no_project_is_loaded(server, monkey
 @pytest.mark.asyncio
 async def test_canned_prompts_include_knx_context(server):
     traffic = await server.get_prompt("analyze_bus_traffic", {"hours": "2"})
-    traffic_text = traffic.messages[0].content.text
-    assert "last 2 hour(s)" in traffic_text
-    assert "Do not send or modify bus values" in traffic_text
-    assert "Group addresses (GAs)" in traffic_text
-
-    missing_dpts = await server.get_prompt("find_group_addresses_without_dpts")
-    dpt_text = missing_dpts.messages[0].content.text
-    assert "knx://project/group-addresses" in dpt_text
-    assert "Do not infer a DPT" in dpt_text
     text = traffic.messages[0].content.text
     assert "last 2 hour(s)" in text
     assert "Do not send or modify bus values" in text
